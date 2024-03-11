@@ -1,13 +1,13 @@
 # chiron/evaluation/pipeline.py
 
 import argparse
-from typing import Dict, List
+from typing import Dict
 
 import numpy as np
 import torch
 from torch.utils.data import DataLoader, TensorDataset
 
-from chiron.data.openhermes import OpenHermesDataset
+
 from chiron.evaluation.downstream_tasks import (
     semantic_similarity_prediction,
     text_classification,
@@ -64,9 +64,9 @@ def main(config_path: str) -> None:
 
     # Generate word embeddings
     embedding_model = Word2VecEmbedding(**config["embedding_params"])
-    embedding_model.train_word2vec(
-        preprocessed_conversations, epochs=config["embedding_params"]["epochs"]
-    )
+    # embedding_model.train_word2vec(
+    #     preprocessed_conversations, epochs=config["embedding_params"]["epochs"]
+    # )
     embeddings = []
     for conv in preprocessed_conversations:
         conv_embeddings = [embedding_model.generate_embeddings(turn) for turn in conv]
@@ -110,7 +110,7 @@ def main(config_path: str) -> None:
         "learning_rate": config["learning_rate"],
     }
     train(
-        snn_model, sdr_embeddings_list, config["adjacency_matrix"], train_config, device
+        snn_model, sdr_embeddings_list, train_config, device
     )
 
     # Create data loader for evaluation

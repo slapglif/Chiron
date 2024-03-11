@@ -1,24 +1,24 @@
+from typing import Dict, Any, List
+
 import numpy as np
 import torch
+from torch.optim import AdamW
 from torch.utils.data import DataLoader, TensorDataset
 from tqdm import tqdm
-from typing import Dict, Any, List
 from transformers import get_linear_schedule_with_warmup
-from torch.optim import AdamW
-from sklearn.metrics import accuracy_score, f1_score
 
-from chiron.layers.snn.model import SNNModel, create_adjacency_matrix
 from chiron.evaluation.downstream_tasks import (
     semantic_similarity_prediction,
     text_classification,
 )
+from chiron.layers.snn.model import SNNModel, create_adjacency_matrix
 
 
 def train(
-    model: SNNModel,
-    sdr_embeddings: List[List[float]],
-    config: Dict[str, Any],
-    device: torch.device,
+        model: SNNModel,
+        sdr_embeddings: List[List[float]],
+        config: Dict[str, Any],
+        device: torch.device,
 ) -> None:
     # Set device
     model.to(device)
@@ -92,13 +92,13 @@ def train(
                 train_loss += loss.item() * sdr_batch.size(0)
 
                 train_loss /= len(dataset)
-                print(f"Epoch {epoch+1}/{config['num_epochs']} - Train Loss: {train_loss:.4f}")  # noqa: E501
+                print(f"Epoch {epoch + 1}/{config['num_epochs']} - Train Loss: {train_loss:.4f}")  # noqa: E501
 
         # Evaluate the model
         model.eval()
         with torch.no_grad():
             eval_scores = evaluate(model, dataloader, device)
-            print(f"Epoch {epoch+1}/{config['num_epochs']} - Eval Loss: {eval_scores['eval_loss']:.4f}")
+            print(f"Epoch {epoch + 1}/{config['num_epochs']} - Eval Loss: {eval_scores['eval_loss']:.4f}")
 
             # Perform downstream tasks evaluation
             sdr_embeddings_tensor = sdr_embeddings_tensor.to(device)
@@ -111,19 +111,23 @@ def train(
                 outputs.cpu().numpy(), config["labels"]
             )
             print(
-                f"Semantic Similarity Prediction - Accuracy: {semantic_sim_accuracy:.4f}, F1 Score: {semantic_sim_f1:.4f}"
+                f"Semantic Similarity Prediction - Accuracy: {semantic_sim_accuracy:.4f}, F1 Score: {semantic_sim_f1:.4f}"  # noqa: E501
+                # noqa: E501
             )
             print(
-                f"Text Classification - Accuracy: {text_class_accuracy:.4f}, F1 Score: {text_class_f1:.4f}"
+                f"Text Classification - Accuracy: {text_class_accuracy:.4f}, F1 Score: {text_class_f1:.4f}"  # noqa: E501
+                # noqa: E501
             )
             # Save the model checkpoint
             torch.save(model.state_dict(), f"checkpoints/model_epoch_{epoch + 1}.pt")
 
             # Release unused cached memory
             torch.cuda.empty_cache()
+
+
 def evaluate(
-    model: SNNModel, dataloader: DataLoader, device: torch.device
-    ) -> Dict[str, float]:
+        model: SNNModel, dataloader: DataLoader, device: torch.device
+) -> Dict[str, float]:
     """
     Evaluate the model on the given data loader.
     Args:
@@ -140,7 +144,7 @@ def evaluate(
     with torch.no_grad():
         for batch in dataloader:
             sdr_batch, adjacency_batch = batch
-            sdr_batch, adjacency_batch = sdr_batch.to(device), adjacency_batch.to(device)
+            sdr_batch, adjacency_batch = sdr_batch.to(device), adjacency_batch.to(device)  # noqa: E501
 
             outputs = model(sdr_batch, adjacency_batch)
             targets = sdr_batch[1:]  # Shift the targets by 1 timestep
@@ -152,4 +156,3 @@ def evaluate(
 
     evaluation_scores = {"eval_loss": eval_loss}
     return evaluation_scores
-

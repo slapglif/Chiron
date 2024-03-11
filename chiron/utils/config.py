@@ -1,7 +1,7 @@
 import json
 from typing import Any
 
-
+# TODO: CONVERT this to a dataclass
 class Config:
     """
     Configuration class to handle settings for the Semantic Folding pipeline.

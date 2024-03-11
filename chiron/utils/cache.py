@@ -85,6 +85,7 @@ def cache_data(data: Any, key: str) -> None:
         logger.error(f"Error occurred while caching data for key '{key}': {str(e)}")
 
 def load_cached_data(key: str) -> Any:
+   # TODO: fix this method, it was breaking the app
     return None
     """
     Load cached data from Redis.
