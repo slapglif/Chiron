@@ -1,4 +1,3 @@
-# chiron/evaluation/pipeline.py
 
 import argparse
 from typing import Dict
@@ -6,7 +5,6 @@ from typing import Dict
 import numpy as np
 import torch
 from torch.utils.data import DataLoader, TensorDataset
-
 
 from chiron.evaluation.downstream_tasks import (
     semantic_similarity_prediction,
@@ -19,19 +17,6 @@ from chiron.preprocessing.embedding import Word2VecEmbedding
 from chiron.preprocessing.text_preprocessing import TextPreprocessor
 from chiron.train import train, evaluate
 from chiron.utils.config import Config
-
-
-def convert_sdr_embeddings_to_list(sdr_embeddings: np.ndarray) -> object:
-    """
-    Convert SDR embeddings from numpy array to list of lists.
-
-    Args:
-        sdr_embeddings (np.ndarray): SDR embeddings as a numpy array.
-
-    Returns:
-        List[List[float]]: SDR embeddings as a list of lists.
-    """
-    return sdr_embeddings.tolist()
 
 
 def main(config_path: str) -> None:
@@ -47,13 +32,12 @@ def main(config_path: str) -> None:
     # Load dataset
     from datasets import load_dataset
 
-    # Load dataset
     dataset = load_dataset(
         config["dataset_params"]["dataset_name"],
         config["dataset_params"]["dataset_config"],
         split=config["dataset_params"]["split"],
     )
-    conversations = dataset.get("conversations")
+    conversations = dataset["conversations"]
 
     # Preprocess text
     preprocessor = TextPreprocessor(**config["preprocessing_params"])
@@ -64,9 +48,6 @@ def main(config_path: str) -> None:
 
     # Generate word embeddings
     embedding_model = Word2VecEmbedding(**config["embedding_params"])
-    # embedding_model.train_word2vec(
-    #     preprocessed_conversations, epochs=config["embedding_params"]["epochs"]
-    # )
     embeddings = []
     for conv in preprocessed_conversations:
         conv_embeddings = [embedding_model.generate_embeddings(turn) for turn in conv]
@@ -82,16 +63,16 @@ def main(config_path: str) -> None:
             conv_sdr_embeddings.append(turn_sdr_embeddings)
         sdr_embeddings.append(conv_sdr_embeddings)
 
-    # Convert SDR embeddings to list of lists
+    # Convert SDR embeddings to a list of tensors
     sdr_embeddings_list = []
-    for conv_sdr_embeddings in sdr_embeddings:
-        conv_sdr_embeddings_list = []
-        for turn_sdr_embeddings in conv_sdr_embeddings:
-            turn_sdr_embeddings_list = convert_sdr_embeddings_to_list(
-                turn_sdr_embeddings
-            )
-            conv_sdr_embeddings_list.append(turn_sdr_embeddings_list)
-        sdr_embeddings_list.append(conv_sdr_embeddings_list)
+    for i, conv_sdr_embeddings in enumerate(sdr_embeddings):
+        for j, turn_sdr_embeddings in enumerate(conv_sdr_embeddings):
+            if len(sdr_embeddings_list) < len(conv_sdr_embeddings):
+                sdr_embeddings_list.append([])
+            sdr_embeddings_list[j].append(torch.FloatTensor(turn_sdr_embeddings))
+
+    # Create an adjacency matrix
+    adjacency_matrix_tensor = torch.ones((len(sdr_embeddings_list), len(sdr_embeddings_list)))
 
     # Create SNN model
     snn_model = SNNModel(
@@ -109,21 +90,10 @@ def main(config_path: str) -> None:
         "num_epochs": config["num_epochs"],
         "learning_rate": config["learning_rate"],
     }
-    train(
-        snn_model, sdr_embeddings_list, train_config, device
-    )
+    train(snn_model, sdr_embeddings_list, train_config, device, adjacency_matrix_tensor)
 
     # Create data loader for evaluation
-    sdr_embeddings_tensor = []
-    for conv_sdr_embeddings_list in sdr_embeddings_list:
-        conv_sdr_embeddings_tensor = []
-        for turn_sdr_embeddings_list in conv_sdr_embeddings_list:
-            turn_sdr_embeddings_tensor = torch.FloatTensor(turn_sdr_embeddings_list)
-            conv_sdr_embeddings_tensor.append(turn_sdr_embeddings_tensor)
-        sdr_embeddings_tensor.append(conv_sdr_embeddings_tensor)
-
-    adjacency_matrix_tensor = torch.FloatTensor(config["adjacency_matrix"])
-    dataset = TensorDataset(*sdr_embeddings_tensor, adjacency_matrix_tensor)
+    dataset = TensorDataset(*sdr_embeddings_list, adjacency_matrix_tensor)
     dataloader = DataLoader(dataset, batch_size=config["batch_size"])
 
     # Evaluate model and plot metrics

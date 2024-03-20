@@ -1,4 +1,3 @@
-# evaluation/downstream_tasks.py
 
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import accuracy_score, f1_score

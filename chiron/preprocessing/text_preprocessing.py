@@ -10,19 +10,26 @@ from chiron.utils.cache import load_cached_data, cache_data
 
 
 class TextPreprocessor:
-    """Class for preprocessing text data."""
-
-    def __init__(self, min_freq: int, max_vocab_size: int):
-        """
-        Initialize the TextPreprocessor.
-
-        Args:
-            min_freq (int): Minimum frequency threshold for including a token in the vocabulary.
-            max_vocab_size (int): Maximum size of the vocabulary.
-        """
+    def __init__(self, min_freq: int, max_vocab_size: int, **kwargs):
         self.min_freq = min_freq
         self.max_vocab_size = max_vocab_size
         self.vocab = None
+        self.config = kwargs
+
+    def tokens_to_indices(self, tokenized_texts: List[str]) -> List[int]:
+        """
+        Convert tokenized text to numerical indices based on the vocabulary.
+
+        Args:
+            tokenized_texts (List[str]): The tokenized text.
+
+        Returns:
+            List[int]: A list of numerical indices representing the tokenized text.
+        """
+        if self.vocab is None:
+            raise ValueError("Vocabulary has not been built yet.")
+
+        return [self.vocab.get(token, self.vocab.get('<UNK>', 0)) for token in tokenized_texts]
 
     @staticmethod
     def preprocess_text(text: str) -> str:
@@ -52,8 +59,6 @@ class TextPreprocessor:
             List[str]: List of tokens.
         """
         return text.split()
-
-
 
     @staticmethod
     def count_token_frequencies(tokenized_texts: List[List[str]]) -> Counter:
