@@ -25,18 +25,13 @@ class SpikingTransformerEncoder(nn.Module):
 
         self.embedding = nn.Linear(1, d_model)
         self.pos_encoder = PositionalEncoding(d_model, dropout)
-        self.device = torch.device("cpu")
+        self.device = torch.device("cuda:0")
 
         encoder_layer = nn.TransformerEncoderLayer(
-            d_model,
-            nhead,
-            dropout=dropout,
-            batch_first=True
+            d_model, nhead, dropout=dropout, batch_first=True
         )
         self.transformer_encoder = nn.TransformerEncoder(
-            encoder_layer,
-            num_layers,
-            enable_nested_tensor=True
+            encoder_layer, num_layers, enable_nested_tensor=True
         )
 
     def forward(self, src: torch.Tensor) -> torch.Tensor:

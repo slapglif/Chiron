@@ -39,6 +39,8 @@ def dict_to_struct_type(obj: dict) -> pa.DataType:
             field_type = pa.string()
         fields.append(pa.field(key, field_type))
     return pa.struct(fields)
+
+
 def cache_data(data: Any, key: str) -> None:
     """
     Cache the data in Redis using Apache Arrow serialization.
@@ -52,6 +54,7 @@ def cache_data(data: Any, key: str) -> None:
         return
 
     try:
+
         def convert_unsupported_types(item):
             if isinstance(item, tuple):
                 return list(item)
@@ -71,7 +74,9 @@ def cache_data(data: Any, key: str) -> None:
             arrays = [pa.array(data)]
 
         # Create a RecordBatch from the arrays
-        batch = pa.RecordBatch.from_arrays(arrays, names=[f'col{i}' for i in range(len(arrays))])
+        batch = pa.RecordBatch.from_arrays(
+            arrays, names=[f"col{i}" for i in range(len(arrays))]
+        )
 
         # Convert the RecordBatch to a Table
         table = pa.Table.from_batches([batch])
@@ -80,12 +85,13 @@ def cache_data(data: Any, key: str) -> None:
         serialized_data = table.to_string()
         # Store the serialized data in Redis
         redis_client.set(key, serialized_data)
-        # logger.info(f"Data cached with key: {key}")
+        # logger.debug(f"Data cached with key: {key}")
     except Exception as e:
         logger.error(f"Error occurred while caching data for key '{key}': {str(e)}")
 
+
 def load_cached_data(key: str) -> Any:
-   # TODO: fix this method, it was breaking the app
+    # TODO: fix this method, it was breaking the app
     return None
     """
     Load cached data from Redis.

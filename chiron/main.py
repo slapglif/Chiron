@@ -1,272 +1,260 @@
-import asyncio
-import sys
-from typing import Dict, List, Any
-
+# main.py
 import argparse
+import sys
+
 import numpy as np
 import torch
-from datasets import load_dataset
+import torch.nn as nn
 from loguru import logger
-from torch.utils.data import DataLoader, TensorDataset
-from tqdm import tqdm
+from sklearn.model_selection import KFold
+from torch.utils.data import DataLoader
+from torch.utils.tensorboard import SummaryWriter
+from transformers import BertTokenizer
 
 from chiron.evaluation.downstream_tasks import (
     semantic_similarity_prediction,
     text_classification,
 )
+from chiron.evaluation.metrics import evaluate_text_prediction
 from chiron.evaluation.visualization import plot_evaluation_metrics
 from chiron.layers.sdr.sdr_generation import SDRGenerator
-from chiron.layers.snn.model import SNNModel, create_adjacency_matrix_parallel
+from chiron.layers.snn.model import SNNModel, create_adjacency_matrix
+from chiron.pipeline import TextPredictionPipeline
 from chiron.preprocessing.embedding import Word2VecEmbedding
 from chiron.preprocessing.text_preprocessing import TextPreprocessor
 from chiron.train import train, evaluate
-from chiron.utils.cache import load_cached_data, cache_data
 from chiron.utils.config import Config
+from chiron.utils.data import SemanticFoldingDataset
 
 
-def convert_sdr_embeddings_to_list(sdr_embeddings: np.ndarray) -> object:
-    """
-    Convert SDR embeddings from numpy array to list of lists.
-
-    Args:
-        sdr_embeddings (np.ndarray): SDR embeddings as a numpy array.
-
-    Returns:
-        List[List[float]]: SDR embeddings as a list of lists.
-    """
-    sdr_list = sdr_embeddings.tolist()
-    return sdr_list
-
-
-async def build_sdr_embeddings_list(
-        i: int,
-        embeddings: List[Any],
-        config: Dict[str, Any],
-        sdr_embeddings_key: str,
-        sdr_embeddings_list: List[Any],
-) -> None:
-    """
-    Build SDR embeddings list in an asynchronous manner.
-
-    Args:
-        i (int): Index for slicing embeddings.
-        embeddings (List[Any]): List of embeddings.
-        config (Dict[str, Any]): Configuration dictionary.
-        sdr_embeddings_key (str): Key for caching SDR embeddings.
-        sdr_embeddings_list (List[Any]): List to extend with SDR embeddings.
-    """
-    batch_embeddings = embeddings[i: i + config["batch_size"]]
-    batch_sdr_embeddings_key = f"{sdr_embeddings_key}_{i}"
-    batch_sdr_embeddings = load_cached_data(batch_sdr_embeddings_key)
-    if not batch_sdr_embeddings:
-        sdr_generator = SDRGenerator(**config["sdr_params"])
-        batch_sdr_embeddings = sdr_generator.generate_sdr_embeddings(batch_embeddings)
-        cache_data(batch_sdr_embeddings, batch_sdr_embeddings_key)
-    else:
-        logger.info(f"Loaded cached SDR embeddings for batch {i}")
-    sdr_embeddings_list.extend(batch_sdr_embeddings)
-
-
-def generate_labels(sdr_embeddings: np.ndarray) -> np.ndarray:
-    """
-    Generate labels dynamically based on SDR embeddings.
-
-    Args:
-        sdr_embeddings (np.ndarray): SDR embeddings array.
-
-    Returns:
-        np.ndarray: Generated labels array.
-    """
-    # Example: Generate labels based on the sum of active bits in each SDR embedding
-    active_bits_sum = np.sum(sdr_embeddings, axis=1)
-
-    # Define threshold values for label assignment
-    threshold_low = np.percentile(active_bits_sum, 33.33)
-    threshold_high = np.percentile(active_bits_sum, 66.67)
-
-    # Assign labels based on the thresholds
-    labels = np.where(active_bits_sum < threshold_low, "low", "medium")
-    labels = np.where(active_bits_sum >= threshold_high, "high", labels)
-
-    return labels
-
-
-@logger.catch
 def main(config_path: str) -> None:
     """
-    Main function to run the Semantic Folding training pipeline.
+    Main function to run the Semantic Folding training pipeline with k-fold cross-validation.
 
     Args:
         config_path (str): Path to the configuration file.
     """
-    logger.info("Starting Semantic Folding training pipeline...")
-
     # Load configuration
-    logger.info(f"Loading configuration from {config_path}")
     config = Config(config_path)
-    device = config["device"]
+
+    # Set up TensorBoard writer
+    writer = SummaryWriter(log_dir="runs")
 
     # Load dataset
-    dataset_key = f"dataset_{config['dataset_params']['dataset_name']}_{config['dataset_params']['dataset_config']}_{config['dataset_params']['split']}"
-    data = load_cached_data(dataset_key)
-    if not data:
-        logger.info("Loading dataset...")
-        dataset = load_dataset(
-            config["dataset_params"]["dataset_name"],
-            config["dataset_params"]["dataset_config"],
-            split=config["dataset_params"]["split"],
-            streaming=False,
-            cache_dir=".cache",
+    from datasets import load_dataset
+
+    dataset = load_dataset(
+        config["dataset_params"]["dataset_name"],
+        config["dataset_params"]["dataset_config"],
+        split=config["dataset_params"]["split"],
+    )
+    conversations = dataset["conversations"]
+    logger.info(f"Number of conversations: {len(conversations)}")
+
+    # Preprocess text
+    logger.info("Preprocessing text...")
+    preprocessor = TextPreprocessor(**config["preprocessing_params"])
+    preprocessed_conversations = preprocessor.preprocess(
+        conversations, cache_key="preprocessed_conversations"
+    )
+    logger.info(
+        f"Number of preprocessed conversations: {len(preprocessed_conversations)}"
+    )
+    logger.debug(f"First preprocessed conversation: {preprocessed_conversations[0]}")
+
+    # Generate word embeddings
+    logger.info("Generating word embeddings...")
+    embedding_model = Word2VecEmbedding(**config["embedding_params"])
+    embeddings = embedding_model.generate_embeddings(
+        preprocessed_conversations, cache_key="embeddings"
+    )
+    logger.info(f"Number of embeddings: {len(embeddings)}")
+
+    # Generate SDRs
+    logger.info("Generating SDRs...")
+    sdr_generator = SDRGenerator(**config["sdr_params"])
+    sdr_embeddings = sdr_generator.generate_sdr_embeddings(embeddings)
+    logger.info(f"SDR embeddings shape: {sdr_embeddings.shape}")
+
+    # Create an adjacency matrix
+    logger.info("Creating adjacency matrix...")
+    device = torch.device(config["device"])
+    sdr_embeddings_float = sdr_embeddings.astype(float)
+
+    adjacency_matrix_sparse = create_adjacency_matrix(
+        sdr_embeddings_float,
+        threshold=config["adjacency_matrix"]["threshold"],
+        subsample_rate=config["adjacency_matrix"]["subsample_rate"],
+        n_jobs=config["adjacency_matrix"].get("n_jobs", -1),
+        chunk_size=config["adjacency_matrix"].get("chunk_size", 5000),
+        device=device,
+    )
+
+    # Load the tokenizer
+    tokenizer = BertTokenizer.from_pretrained("bert-base-uncased")
+
+    # Create a vocabulary dictionary from the preprocessed conversations
+    preprocessed_conversations = [
+        [token] for conv in preprocessed_conversations for token in conv
+    ]
+
+    vocab = {}
+    for token in set(token for conv in preprocessed_conversations for token in conv):
+        vocab[token] = len(vocab)
+
+    # Create dataset
+    dataset = SemanticFoldingDataset(sdr_embeddings, tokenizer, labels=None)
+
+    # Perform k-fold cross-validation
+    k = config.get("k_folds", 5)
+    kfold = KFold(n_splits=k, shuffle=True, random_state=42)
+    fold_metrics = []
+
+    # Initialize fold_metrics with default values for each metric
+    default_metrics = {
+        "accuracy": 0.0,
+        "f1_score": 0.0,
+        "precision": 0.0,
+        "recall": 0.0,
+        "loss": float("inf"),
+    }
+
+    for fold, (train_idx, val_idx) in enumerate(kfold.split(dataset)):
+        logger.info(f"Training fold {fold + 1}/{k}")
+
+        train_dataset = torch.utils.data.Subset(dataset, train_idx)
+        val_dataset = torch.utils.data.Subset(dataset, val_idx)
+
+        train_dataloader = DataLoader(
+            train_dataset,
+            batch_size=config["batch_size"],
+            shuffle=True,
+            num_workers=config["num_workers"] or 4,
+            pin_memory=True,
         )
 
-        data = dataset["conversations"]
-        logger.info(f"Loaded dataset with {len(data)} conversations")
+        val_dataloader = DataLoader(
+            val_dataset,
+            batch_size=config["batch_size"],
+            shuffle=False,
+            num_workers=config["num_workers"] or 4,
+            pin_memory=True,
+        )
 
-        # Preprocess text
-        preprocessed_data_key = f"preprocessed_data_{dataset_key}"
-        preprocessed_data = load_cached_data(preprocessed_data_key)
-
-        logger.info("Preprocessing text...")
-        if not preprocessed_data:
-            preprocessor = TextPreprocessor(**config["preprocessing_params"])
-            preprocessed_data = preprocessor.preprocess(data, cache_key=preprocessed_data_key)
-            logger.info(f"Preprocessed {len(preprocessed_data)} conversations")
-        else:
-            logger.info(f"Loaded cached preprocessed data with {len(preprocessed_data)} conversations")
-
-        # Generate word embeddings
-        embeddings_key = f"embeddings_{preprocessed_data_key}_{config['embedding_params']}"  # noqa: E501
-        embeddings = load_cached_data(embeddings_key)
-        logger.info("Generating word embeddings...")
-        if not embeddings:
-            embedding_model = Word2VecEmbedding(**config["embedding_params"])
-            embeddings = embedding_model.generate_embeddings(
-                preprocessed_data,
-                cache_key=embeddings_key,
-                batch_size=config["batch_size"],
-            )
-            logger.info(f"Generated {len(embeddings)} word embeddings")
-        else:
-            logger.info(f"Loaded cached word embeddings with {len(embeddings)} embeddings")
-
-        # Generate SDR embeddings
-        sdr_embeddings_key = f"sdr_embeddings_{embeddings_key}_{config['sdr_params']}"
-        sdr_embeddings = load_cached_data(sdr_embeddings_key)
-        logger.info("Generating SDR embeddings...")
-        if not sdr_embeddings:
-            sdr_embeddings_list = []
-            for i in tqdm(range(0, len(embeddings), config["batch_size"])):
-                asyncio.run(
-                    build_sdr_embeddings_list(
-                        i,
-                        embeddings,
-                        config.config,
-                        sdr_embeddings_key,
-                        sdr_embeddings_list,
-                    )
-                )
-
-            sdr_embeddings = np.array(sdr_embeddings_list)
-            logger.info(f"Generated {len(sdr_embeddings)} SDR embeddings")
-        else:
-            logger.info(f"Loaded cached SDR embeddings with {len(sdr_embeddings)} embeddings")
-
-        # Generate labels dynamically
-        logger.info("Generating labels dynamically...")
-        labels = generate_labels(sdr_embeddings)
-
-        # Convert embeddings to a NumPy array
-        embeddings = np.array(embeddings)
-
-        # Ensure all tensors have the same size along the first dimension
-        num_samples = min(sdr_embeddings.shape[0], embeddings.shape[0], labels.shape[0])
-        sdr_embeddings = sdr_embeddings[:num_samples]
-        embeddings = embeddings[:num_samples]
-        labels = labels[:num_samples]
-
-        # Create adjacency matrix
-        adjacency_matrix_key = f"adjacency_matrix_{sdr_embeddings_key}_{config['snn_params']}"
-        adjacency_matrix = load_cached_data(adjacency_matrix_key)
-        logger.info("Creating adjacency matrix...")
-        if not adjacency_matrix:
-            adjacency_matrix = create_adjacency_matrix_parallel(
-                sdr_embeddings,
-                n_jobs=config["adjacency_matrix"]["n_jobs"],
-            )
-            logger.info(f"Created adjacency matrix of shape {adjacency_matrix.shape}")
-        else:
-            logger.info(f"Loaded cached adjacency matrix of shape {adjacency_matrix.shape}")
-
-        # Create SNN model
-        logger.info("Creating SNN model...")
+        logger.info(f"Creating SNN model for fold {fold + 1}...")
         snn_model = SNNModel(
-            sp_params={},
+            sp_params=config["sdr_params"],
             snn_params=config["snn_params"],
             gat_params=config["gat_params"],
-            encoder_params=config["encoder_params"],
-            decoder_params=config["decoder_params"],
             htm_params=config["htm_params"],
-        ).to(device)
-        logger.info(f"Created SNN model {snn_model}")
-
-        # Prepare data for training
-        logger.info("Preparing data for training...")
-        sdr_embeddings_tensor = torch.tensor(sdr_embeddings, dtype=torch.float32)
-
-        # Convert adjacency matrix to sparse COO tensor
-        nonzero_indices = torch.tensor(adjacency_matrix.nonzero(), dtype=torch.long)
-        values = torch.tensor(adjacency_matrix.data, dtype=torch.float32)
-        adjacency_matrix_tensor = torch.sparse_coo_tensor(
-            nonzero_indices,
-            values,
-            adjacency_matrix.shape
-        )
-
-       # embedded_conversations_tensor = torch.tensor(embeddings, dtype=torch.float32)
-
-        # Create labels tensor
-        labels_tensor = torch.tensor(np.vectorize(lambda x: {"low": 0, "medium": 1, "high": 2}[x])(labels),
-                                     dtype=torch.long)
-
-        # Train SNN model
-        logger.info("Training SNN model...")
-        train(
-            model=snn_model,
-            sdr_embeddings=sdr_embeddings_tensor,
-            adjacency_matrix=adjacency_matrix_tensor,
-            conversation_texts=preprocessed_data,
-            labels=labels_tensor,
-            config=config["train_params"],
             device=device,
+            vocab=vocab,
+            tokenizer=tokenizer,
+        ).to(device)
+
+        # Wrap the model with DataParallel for multi-GPU training
+        if torch.cuda.device_count() > 1:
+            snn_model = nn.DataParallel(snn_model)
+
+        # Train model
+        train_config = {
+            "num_epochs": config["num_epochs"],
+            "learning_rate": config["learning_rate"],
+            "accumulation_steps": config["accumulation_steps"],
+            "patience": config.get("patience", 5),
+        }
+
+        logger.info(f"Training model for fold {fold + 1}...")
+        train(
+            snn_model,
+            train_dataloader,
+            val_dataloader,
+            tokenizer,
+            train_config,
+            device,
+            adjacency_matrix_sparse,
+            writer,
         )
 
-        # Evaluate SNN model
-        logger.info("Evaluating SNN model...")
-        sdr_list = convert_sdr_embeddings_to_list(sdr_embeddings)
-        evaluation_metrics = evaluate(snn_model,
-                                      DataLoader(TensorDataset(sdr_embeddings_tensor), batch_size=config["batch_size"]),
-                                      adjacency_matrix_tensor, device)
-        logger.info(f"Evaluation metrics: {evaluation_metrics}")
+        # Evaluate model and plot metrics
+        logger.info(f"Evaluating model for fold {fold + 1}...")
+        val_metrics = evaluate(
+            snn_model,
+            val_dataloader,
+            tokenizer,
+            device,
+            adjacency_matrix_sparse,
+        )
+        if not val_metrics:
+            logger.warning(
+                f"No validation metrics returned for fold {fold + 1}. Using default values."
+            )
+            val_metrics = default_metrics.copy()
+        fold_metrics.append(val_metrics)
 
-        # Perform downstream tasks
-        logger.info("Performing downstream tasks...")
-        semantic_similarity_results = semantic_similarity_prediction(sdr_list, labels)
-        logger.info(f"Semantic similarity results: {semantic_similarity_results}")
+        # Evaluate text prediction performance
+        logger.info(f"Evaluating text prediction for fold {fold + 1}...")
+        text_prediction_metrics = evaluate_text_prediction(
+            snn_model,
+            tokenizer,
+            val_dataset,
+            device,
+            max_length=config["text_prediction"]["max_length"],
+            num_return_sequences=config["text_prediction"]["num_return_sequences"],
+        )
+        logger.info(
+            f"Text prediction metrics for fold {fold + 1}: {text_prediction_metrics}"
+        )
 
-        text_classification_results = text_classification(sdr_list, labels)
-        logger.info(f"Text classification results: {text_classification_results}")
+        # Compute average metrics across folds
+        avg_metrics = {
+            metric: np.mean(
+                [fold.get(metric, default_metrics[metric]) for fold in fold_metrics]
+            )
+            for metric in default_metrics.keys()
+        }
 
-        # Visualize evaluation metrics
-        logger.info("Visualizing evaluation metrics...")
+        logger.info("Average metrics across folds:")
+        for metric, value in avg_metrics.items():
+            logger.info(f"{metric}: {value:.4f}")
+
+        # Create the text prediction pipeline
+        pipeline = TextPredictionPipeline(
+            snn_model,
+            tokenizer,
+            device,
+            max_length=config["text_prediction"]["max_length"],
+            num_return_sequences=config["text_prediction"]["num_return_sequences"],
+        )
+
+        # Perform text prediction
+        input_text = "what is the meaning of life? let me know your thoughts"
+        predicted_texts = pipeline(input_text)
+        logger.info(f"Predicted texts: {predicted_texts}")
+
+        if not config["labels"]:
+            semantic_sim_accuracy, semantic_sim_f1 = 0.0, 0.0
+            text_class_accuracy, text_class_f1 = 0.0, 0.0
+        else:
+            semantic_sim_accuracy, semantic_sim_f1 = semantic_similarity_prediction(
+                sdr_embeddings, config["labels"]
+            )
+            text_class_accuracy, text_class_f1 = text_classification(
+                sdr_embeddings, config["labels"]
+            )
+        logger.info("Plotting evaluation metrics...")
         plot_evaluation_metrics(
-            evaluation_metrics,
-            semantic_similarity_results,
-            text_classification_results,
-            config["visualization_params"],
-            text_class_f1=text_classification_results["f1_score"],
+            avg_metrics,
+            semantic_sim_accuracy,
+            semantic_sim_f1,
+            text_class_accuracy,
+            text_class_f1,
         )
 
-        logger.info("Semantic Folding training pipeline completed.")
+        logger.info("Training completed.")
+
+        # Close TensorBoard writer
+        writer.close()
 
 
 if __name__ == "__main__":
@@ -275,13 +263,12 @@ if __name__ == "__main__":
         "--config", type=str, default="config.json", help="Path to configuration file"
     )
     args = parser.parse_args()
-
-    logger.remove()  # Remove the default logger
+    logger.remove()
     logger.add(
         sys.stderr,
         colorize=True,
         format="<green>{time}</green> <level>{message}</level>",
+        level="INFO",
     )
-    logger.add("logs/semantic_folding_{time}.log", serialize=True)
-
-    main(args.config)
+    logger.add("logs/semantic_folding_{time}.log", serialize=True, level="DEBUG")
+    main(config_path=args.config)

@@ -1,9 +1,11 @@
 import concurrent.futures
+import random
 import re
 from collections import Counter
 from typing import List, Dict, Any
 
 from loguru import logger
+from nltk.corpus import wordnet
 from tqdm import tqdm
 
 from chiron.utils.cache import load_cached_data, cache_data
@@ -29,7 +31,10 @@ class TextPreprocessor:
         if self.vocab is None:
             raise ValueError("Vocabulary has not been built yet.")
 
-        return [self.vocab.get(token, self.vocab.get('<UNK>', 0)) for token in tokenized_texts]
+        return [
+            self.vocab.get(token, self.vocab.get("<UNK>", 0))
+            for token in tokenized_texts
+        ]
 
     @staticmethod
     def preprocess_text(text: str) -> str:
@@ -79,9 +84,9 @@ class TextPreprocessor:
 
             token_counts = Counter()
             for future in tqdm(
-                    concurrent.futures.as_completed(futures),
-                    total=len(futures),
-                    desc="Counting token frequencies",
+                concurrent.futures.as_completed(futures),
+                total=len(futures),
+                desc="Counting token frequencies",
             ):
                 token_counts.update(future.result())
 
@@ -99,8 +104,8 @@ class TextPreprocessor:
         self.vocab = {"<PAD>": 0, "<UNK>": 1}
 
         for token, count in tqdm(
-                token_counts.most_common(self.max_vocab_size - 2),
-                desc="Building vocabulary",
+            token_counts.most_common(self.max_vocab_size - 2),
+            desc="Building vocabulary",
         ):  # noqa: E501
             if count >= self.min_freq:
                 self.vocab[token] = len(self.vocab)
@@ -123,6 +128,39 @@ class TextPreprocessor:
             for item in batch
         )
 
+    def augment_text(self, text: str) -> str:
+        """
+        Augment the input text by applying random transformations.
+
+        Args:
+            text (str): Input text.
+
+        Returns:
+            str: Augmented text.
+        """
+        words = text.split()
+        augmented_words = []
+
+        for word in words:
+            if random.random() < 0.1:  # 10% chance of augmentation
+                synonyms = []
+                for syn in wordnet.synsets(word):
+                    for lemma in syn.lemmas():
+                        if lemma.name() != word:
+                            synonyms.append(lemma.name())
+
+                if synonyms:
+                    augmented_word = random.choice(synonyms)
+                else:
+                    augmented_word = word
+            else:
+                augmented_word = word
+
+            augmented_words.append(augmented_word)
+
+        augmented_text = " ".join(augmented_words)
+        return augmented_text
+
     def preprocess_text_batch(self, batch: dict) -> List[List[str]]:
         preprocessed_batch = []
         # for batch in batches:
@@ -130,19 +168,24 @@ class TextPreprocessor:
         ai = ""
         for dict_list in batch:
             for text_dict in dict_list:
-                human = text_dict.get("value", "") if text_dict.get("from") == "human" else ""
+                human = (
+                    text_dict.get("value", "")
+                    if text_dict.get("from") == "human"
+                    else ""
+                )
                 ai = text_dict.get("value", "") if text_dict.get("from") == "ai" else ""
 
             final = f"\nhuman:\n{human}\nai:\n{ai}\n"
             preprocessed_text = self.preprocess_text(final)
-            tokenized_text = self.tokenize_text(preprocessed_text)
+            augmented_text = self.augment_text(
+                preprocessed_text
+            )  # Apply data augmentation
+            tokenized_text = self.tokenize_text(augmented_text)
             preprocessed_batch.append(tokenized_text)
 
         return preprocessed_batch
 
-    def preprocess(
-            self, texts: Dict[str, Any], cache_key: str
-    ) -> List[List[str]]:
+    def preprocess(self, texts: Dict[str, Any], cache_key: str) -> List[List[str]]:
         preprocessed_data = load_cached_data(cache_key)
         if preprocessed_data is None:
             preprocessed_data = self.preprocess_text_batch(texts)

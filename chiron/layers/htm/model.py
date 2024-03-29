@@ -4,9 +4,8 @@ from typing import List
 
 import numpy as np
 import torch
+from loguru import logger
 from torch import nn
-
-from chiron.utils.config import Config
 
 
 class HTMSpatialPooler:
@@ -27,7 +26,6 @@ class HTMSpatialPooler:
         duty_cycle_period: int,
         max_boost: float,
         seed: int,
-
     ):
         """
         Initialize the HTMSpatialPooler.
@@ -136,9 +134,12 @@ class HTMSpatialPooler:
             np.ndarray: The overlap scores for each minicolumn.
         """
         overlap = np.zeros(self.num_minicolumns)
+        input_vector = input_vector.reshape(input_vector.shape[0], -1)
         for i in range(self.num_minicolumns):
-            connected_synapses = self.connections[i]
-            overlap[i] = np.sum(input_vector * connected_synapses)
+            connected_synapses = self.connections[i][: input_vector.shape[1]].astype(
+                bool
+            )  # noqa: E501
+            overlap[i] = np.sum(input_vector[:, connected_synapses], axis=1).sum()
         return overlap
 
     def inhibit_columns(self, overlap: np.ndarray) -> np.ndarray:
@@ -216,10 +217,16 @@ class HTMSpatialPooler:
         """
         for i in range(self.num_minicolumns):
             if active_columns[i]:
-                self.permanences[i, input_vector == 1] += self.syn_perm_active_inc
-                self.permanences[i, input_vector == 0] -= self.syn_perm_inactive_dec
+                self.permanences[i, :][
+                    self.connections[i] == 1
+                ] += self.syn_perm_active_inc
+                self.permanences[i, :][
+                    self.connections[i] == 0
+                ] -= self.syn_perm_inactive_dec
             else:
-                self.permanences[i, input_vector == 1] -= self.syn_perm_inactive_dec
+                self.permanences[i, :][
+                    self.connections[i] == 1
+                ] -= self.syn_perm_inactive_dec
         self.permanences[self.permanences < 0] = 0
         self.permanences[self.permanences > 1] = 1
         self.connections = np.where(self.permanences >= self.syn_perm_connected, 1, 0)
@@ -285,18 +292,24 @@ class HTMSpatialPooler:
 
 
 class HTMModel(nn.Module):
-    def __init__(self, **kwargs):
+    def __init__(self, sdr_dimensions: int, device: torch.device, **kwargs):
         """
         Initialize the HTMModel.
 
         Args:
-            sp_params (dict): The parameters for the spatial pooler.
+            sdr_dimensions (int): The dimensions of the Sparse Distributed Representation (SDR).
+            device (torch.device): The device to use for the model (e.g., torch.device('cuda') or torch.device('cpu')).
+            **kwargs: Additional arguments for the spatial pooler.
         """
-        self.spatial_pooler = HTMSpatialPooler(**kwargs)
-        self.device = torch.device("cpu")
         super(HTMModel, self).__init__()
+        self.spatial_pooler = HTMSpatialPooler(**kwargs)
+        self.output_size = sdr_dimensions
+        self.device = device
+        self.fc = nn.Linear(self.spatial_pooler.num_minicolumns, sdr_dimensions).to(
+            device
+        )  # Adjust the input size of the fully connected layer
 
-    def forward(self, input_sequence: List[torch.Tensor]) -> List[torch.Tensor]:
+    def forward(self, input_sequence: List[torch.Tensor]) -> torch.Tensor:
         """
         Process the input sequence using the HTM model.
 
@@ -304,30 +317,39 @@ class HTMModel(nn.Module):
             input_sequence (List[torch.Tensor]): The sequence of input vectors.
 
         Returns:
-            List[torch.Tensor]: The sequence of active columns.
+            torch.Tensor: The sequence of active columns.
         """
         active_columns_sequence = []
         for input_vector in input_sequence:
-            active_columns = self.spatial_pooler.forward(
-                input_vector
-            )  # Use self.spatial_pooler.forward() instead of self.spatial_pooler()
+            active_columns = self.spatial_pooler.forward(input_vector)
             active_columns_sequence.append(active_columns)
-        return active_columns_sequence
+        active_columns_tensor = torch.stack(active_columns_sequence).to(
+            self.device
+        )  # Move the tensor to the specified device
+        logger.debug(
+            f"""
+           performing htm forward pass on input sequence of length {len(input_sequence)}
+           """
+        )
+        logger.debug(self.inspect())
+        output = self.fc(active_columns_tensor)  # Apply the fully connected layer
+        return output
 
     def inspect(self):
         """
         View the HTM model.
         """
-        print(self.spatial_pooler)
-        print(self.spatial_pooler.connections)
-        print(self.spatial_pooler.permanences)
-        print(self.spatial_pooler.boosting_factors)
-        print(self.spatial_pooler.active_duty_cycles)
-        print(self.spatial_pooler.overlap_duty_cycles)
-        print(self.spatial_pooler.min_overlap_duty_cycles)
-        print(self.spatial_pooler.min_pct_overlap_duty_cycle)
-        print(self.spatial_pooler.duty_cycle_period)
-        print(self.spatial_pooler.max_boost)
-        print(self.spatial_pooler.global_inhibition)
-        print(self.spatial_pooler.inhibition_radius)
-        print(self.spatial_pooler.num_active_columns_per_inhibition_area)
+        # logger.debug(self.spatial_pooler)
+        # logger.debug(self.spatial_pooler.connections)
+        # logger.debug(self.spatial_pooler.permanences)
+        # logger.debug(self.spatial_pooler.boosting_factors)
+        # logger.debug(self.spatial_pooler.active_duty_cycles)
+        # logger.debug(self.spatial_pooler.overlap_duty_cycles)
+        # logger.debug(self.spatial_pooler.min_overlap_duty_cycles)
+        # logger.debug(self.spatial_pooler.min_pct_overlap_duty_cycle)
+        # logger.debug(self.spatial_pooler.duty_cycle_period)
+        # logger.debug(self.spatial_pooler.max_boost)
+        # logger.debug(self.spatial_pooler.global_inhibition)
+        # logger.debug(self.spatial_pooler.inhibition_radius)
+        # logger.debug(self.spatial_pooler.num_active_columns_per_inhibition_area)
+        # return f"Model with {self.output_size} outputs"

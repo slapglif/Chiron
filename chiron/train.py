@@ -1,164 +1,201 @@
 import torch
 import torch.nn as nn
-from torch.optim import AdamW
-from torch.utils.data import DataLoader, TensorDataset
+from loguru import logger
+from torch.utils.data import DataLoader
+from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
-from typing import List
+from transformers import PreTrainedTokenizer
 
-from chiron.evaluation.downstream_tasks import (
-    semantic_similarity_prediction,
-    text_classification,
-)
+from chiron.evaluation.metrics import evaluate_text_prediction
 from chiron.layers.snn.model import SNNModel
 
 
 def train(
     model: SNNModel,
-    sdr_embeddings: torch.Tensor,
-    adjacency_matrix: torch.Tensor,
-    conversation_texts: List[List[str]],
-    labels: torch.Tensor,
+    train_dataloader: torch.utils.data.DataLoader,
+    val_dataloader: torch.utils.data.DataLoader,
+    tokenizer: PreTrainedTokenizer,
     config: dict,
     device: torch.device,
+    adjacency_matrix_sparse: torch.sparse_coo_tensor,
+    writer: SummaryWriter,
 ) -> None:
     """
-    Train the SNN model.
+    Train the SNNModel on the given datasets.
 
     Args:
-        model (SNNModel): The SNN model to train.
-        sdr_embeddings (torch.Tensor): SDR embeddings tensor.
-        adjacency_matrix (torch.Tensor): Adjacency matrix tensor.
-        conversation_texts (List[List[str]]): List of conversation texts, where each conversation is a list of strings.
-        labels (torch.Tensor): Labels tensor for downstream tasks.
-        config (dict): Training configuration.
-        device (torch.device): Device to use for training (GPU or CPU).
+        model (SNNModel): The model to train.
+        train_dataloader (torch.utils.data.DataLoader): The training data loader.
+        val_dataloader (torch.utils.data.DataLoader): The validation data loader.
+        tokenizer (PreTrainedTokenizer): The tokenizer for the language model.
+        config (dict): The training configuration.
+        device (torch.device): The device to run the training on.
+        adjacency_matrix_sparse (torch.sparse_coo_tensor): The adjacency matrix in sparse COO format.
+        writer (SummaryWriter): The TensorBoard writer for logging.
     """
-    # Set device
-    model.to(device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=config["learning_rate"])
+    criterion = nn.NLLLoss()
+    num_classes = (
+        model.output_size
+    )  # Assuming output_size represents the number of classes
+    node_to_class_mapping = {i: i % num_classes for i in range(num_classes)}
 
-    # Ensure all tensors have the same size along the first dimension
-    num_samples = min(sdr_embeddings.size(0), labels.size(0))
-    sdr_embeddings = sdr_embeddings[:num_samples]
-    labels = labels[:num_samples]
-
-    # Create data loader
-    dataset = TensorDataset(sdr_embeddings, labels)
-    dataloader = DataLoader(
-        dataset, batch_size=config["batch_size"], shuffle=True, num_workers=8
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode="min", patience=config["patience"], factor=0.1, verbose=True
     )
 
-    # Define loss function and optimizer
-    criterion = nn.MSELoss()
-    optimizer = AdamW(model.parameters(), lr=config["learning_rate"])
+    best_val_loss = float("inf")
+    patience_counter = 0
+
+    # Set the number of accumulation steps
+    accumulation_steps = config["accumulation_steps"]
+
+    # Enable mixed-precision training
     scaler = torch.cuda.amp.GradScaler()
 
-    # Training loop
-    num_epochs = config["num_epochs"]
-    accumulation_steps = config["accumulation_steps"]
-    num_batches = len(dataloader)
-
-    for epoch in range(num_epochs):
-        model.train()
+    for epoch in range(config["num_epochs"]):
+        logger.info(f"Epoch {epoch + 1}/{config['num_epochs']}")
         train_loss = 0.0
+        model.train()
 
-        progress_bar = tqdm(
-            dataloader, desc=f"Epoch {epoch + 1}/{num_epochs}", unit="batch"
-        )
-        for i, (sdr_batch, labels_batch) in enumerate(progress_bar):
-            sdr_batch = sdr_batch.to(device)
-           #  labels_batch = labels_batch.to(device)
-            adjacency_batch = adjacency_matrix.to(device)
+        # Zero the gradients
+        optimizer.zero_grad()
 
-            batch_start = i * config["batch_size"]
-            batch_end = min((i + 1) * config["batch_size"], len(conversation_texts))
-            conversation_texts_batch = conversation_texts[batch_start:batch_end]
+        for batch_idx, batch in enumerate(
+            tqdm(train_dataloader, desc="Train"), start=1
+        ):
+            # Get the input tensors and labels
+            input_ids, attention_mask, label, node_indices = batch
+            input_ids = input_ids.to(device)
+            attention_mask = attention_mask.to(device)
+            node_indices = node_indices.to(device)
 
+            # Clamp node_indices to the valid range
+            node_indices = node_indices.clamp(min=0, max=num_classes - 1)
+
+            # Convert node_indices to class indices using the mapping
+            class_indices = torch.tensor(
+                [node_to_class_mapping[idx.item()] for idx in node_indices],
+                device=device,
+            )
+
+            # Mixed-precision training
             with torch.cuda.amp.autocast():
-                outputs = model(sdr_batch, adjacency_batch, conversation_texts_batch)
-                targets = sdr_batch[1:]  # Shift the targets by 1 timestep
-                loss = criterion(outputs, targets)
+                # Forward pass
+                outputs = model(
+                    input_ids, attention_mask, adjacency_matrix_sparse, node_indices
+                )
+
+                # Reshape outputs to match the shape of class_indices
+                outputs = outputs.view(-1, num_classes)
+
+                # Compute the loss
+                loss = criterion(outputs, class_indices)
                 loss = loss / accumulation_steps
 
+            # Backward pass with mixed-precision
             scaler.scale(loss).backward()
 
-            if (i + 1) % accumulation_steps == 0 or (i + 1) == num_batches:
+            # Gradient accumulation
+            if batch_idx % accumulation_steps == 0:
+                # Gradient clipping
                 scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+
+                # Update weights
                 scaler.step(optimizer)
                 scaler.update()
                 optimizer.zero_grad()
 
-            train_loss += loss.item() * sdr_batch.size(0)
+            # Accumulate the loss
+            train_loss += loss.item()
 
-            progress_bar.set_postfix(loss=loss.item())
+        # Compute the average training loss
+        train_loss /= len(train_dataloader)
 
-        train_loss /= num_samples
-        print(f"Epoch {epoch + 1}/{num_epochs} - Train Loss: {train_loss:.4f}")
-
-        # Evaluate the model
-        eval_scores = evaluate(model, dataloader, adjacency_matrix, device)
-        print(f"Epoch {epoch + 1}/{num_epochs} - Eval Loss: {eval_scores['eval_loss']:.4f}")
-
-        # Perform downstream tasks evaluation
-        semantic_sim_accuracy, semantic_sim_f1 = semantic_similarity_prediction(
-            sdr_embeddings.cpu().numpy(), labels.cpu().numpy()
-        )
-        text_class_accuracy, text_class_f1 = text_classification(
-            sdr_embeddings.cpu().numpy(), labels.cpu().numpy()
-        )
-        print(
-            f"Semantic Similarity Prediction - Accuracy: {semantic_sim_accuracy:.4f}, F1 Score: {semantic_sim_f1:.4f}"
-        )
-        print(
-            f"Text Classification - Accuracy: {text_class_accuracy:.4f}, F1 Score: {text_class_f1:.4f}"
+        # Evaluate on the validation set
+        val_loss = evaluate(
+            model, val_dataloader, tokenizer, device, adjacency_matrix_sparse
         )
 
-        # Save the model checkpoint
-        checkpoint_path = f"checkpoints/model_epoch_{epoch + 1}.pt"
-        torch.save(model.state_dict(), checkpoint_path)
-        print(f"Model checkpoint saved: {checkpoint_path}")
+        # Log the losses
+        writer.add_scalar("Loss/Train", train_loss, epoch)
+        writer.add_scalar("Loss/Validation", val_loss, epoch)
 
-        # Release unused memory
-        torch.cuda.empty_cache()
+        # Update the learning rate scheduler
+        scheduler.step(val_loss)
 
-    print("Training completed.")
+        # Check for early stopping
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            patience_counter = 0
+        else:
+            patience_counter += 1
+            if patience_counter >= config["patience"]:
+                logger.info(f"Early stopping after {epoch + 1} epochs.")
+                break
+
+        logger.info(
+            f"Epoch {epoch + 1}/{config['num_epochs']}: Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}"
+        )
 
 
 def evaluate(
     model: SNNModel,
     dataloader: DataLoader,
-    adjacency_matrix: torch.Tensor,
+    tokenizer: PreTrainedTokenizer,
     device: torch.device,
-) -> dict:
-    """
-    Evaluate the model on the given data loader.
-
-    Args:
-        model (SNNModel): The model to evaluate.
-        dataloader (DataLoader): The data loader for evaluation data.
-        adjacency_matrix (torch.Tensor): Adjacency matrix tensor.
-        device (torch.device): The device to run the model on (GPU or CPU).
-
-    Returns:
-        dict: Dictionary containing evaluation scores.
-    """
+    adjacency_matrix_sparse: torch.sparse_coo_tensor,
+) -> float:
     model.eval()
-    eval_loss = 0.0
+    criterion = nn.NLLLoss()
+    num_classes = (
+        model.output_size
+    )  # Assuming output_size represents the number of classes
+    node_to_class_mapping = {i: i % num_classes for i in range(num_classes)}
+    total_loss = 0.0
 
     with torch.no_grad():
-        for batch in dataloader:
-            sdr_batch, _ = batch
-            sdr_batch = sdr_batch.to(device)
+        for batch in tqdm(dataloader, desc="Evaluating"):
+            # Get the input tensors and labels
+            input_ids, attention_mask, label, node_indices = batch
 
-            adjacency_batch = adjacency_matrix.to(device)
+            # Move the input tensors and labels to the device
+            input_ids = input_ids.to(device)
+            attention_mask = attention_mask.to(device)
+            node_indices = node_indices.to(device)
 
-            outputs = model(sdr_batch, adjacency_batch, [])
-            targets = sdr_batch[1:]  # Shift the targets by 1 timestep
-            loss = nn.MSELoss()(outputs, targets)
+            # Clamp node_indices to the valid range
+            node_indices = node_indices.clamp(min=0, max=num_classes - 1)
 
-            eval_loss += loss.item() * sdr_batch.size(0)
+            # Convert node_indices to class indices using the mapping
+            class_indices = torch.tensor(
+                [node_to_class_mapping[idx.item()] for idx in node_indices],
+                device=device,
+            )
 
-    eval_loss /= len(dataloader.dataset)
+            # Forward pass
+            outputs = model(
+                input_ids, attention_mask, adjacency_matrix_sparse, node_indices
+            )
 
-    evaluation_scores = {"eval_loss": eval_loss}
-    return evaluation_scores
+            # Reshape outputs to match the shape of class_indices
+            outputs = outputs.view(-1, num_classes)
+
+            # Compute the loss
+            loss = criterion(outputs, class_indices)
+
+            # Accumulate the loss
+            total_loss += loss.item()
+
+    avg_loss = total_loss / len(dataloader)
+
+    # Compute evaluation metrics
+    text_prediction_metrics = evaluate_text_prediction(
+        model, tokenizer, dataloader.dataset, device
+    )
+    logger.info(f"Text Prediction Metrics: {text_prediction_metrics}")
+
+    logger.info(f"Evaluation - Average Loss: {avg_loss:.4f}")
+
+    return avg_loss

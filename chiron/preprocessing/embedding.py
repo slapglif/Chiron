@@ -1,3 +1,4 @@
+# embedding.py
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List
 
@@ -9,7 +10,9 @@ from chiron.utils.cache import load_cached_data, cache_data
 
 
 class Word2VecEmbedding:
-    """Class for generating Word2Vec embeddings."""
+    """
+    Class for generating Word2Vec embeddings.
+    """
 
     def __init__(self, vector_size: int, window: int, min_count: int, workers: int):
         """
@@ -30,7 +33,7 @@ class Word2VecEmbedding:
         )
 
     def generate_embeddings(
-            self, tokenized_texts: List[List[str]], cache_key: str, batch_size: int = 1000
+        self, tokenized_texts: List[List[str]], cache_key: str, batch_size: int = 1000
     ) -> List[List[np.ndarray]]:
         """
         Generate Word2Vec embeddings for the given tokenized texts using threading and batch processing.
@@ -52,7 +55,7 @@ class Word2VecEmbedding:
         return embeddings
 
     def _generate_embeddings_parallel(
-            self, tokenized_texts: List[List[str]], batch_size: int
+        self, tokenized_texts: List[List[str]], batch_size: int
     ) -> List[List[np.ndarray]]:
         """
         Generate Word2Vec embeddings in parallel using multithreading.
@@ -66,7 +69,7 @@ class Word2VecEmbedding:
         """
         total_texts = len(tokenized_texts)
         batches = [
-            tokenized_texts[i: i + batch_size]
+            tokenized_texts[i : i + batch_size]
             for i in range(0, total_texts, batch_size)
         ]
 
@@ -100,9 +103,7 @@ class Word2VecEmbedding:
         batch_embeddings = []
         for text in batch:
             text_embeddings = [
-                self.model[token]
-                for token in text
-                if token in self.model
+                self.model[token] for token in text if token in self.model
             ]
             batch_embeddings.append(text_embeddings)
         return batch_embeddings

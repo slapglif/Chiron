@@ -30,7 +30,7 @@ class SpikingTransformerDecoder(nn.Module):
         self.transformer_decoder = nn.TransformerDecoder(decoder_layer, num_layers)
 
         self.fc_out = nn.Linear(d_model, 1)
-        self.device = torch.device("cpu")
+        self.device = torch.device("cuda:0")
 
     def forward(self, tgt: torch.Tensor, memory: torch.Tensor) -> torch.Tensor:
         """

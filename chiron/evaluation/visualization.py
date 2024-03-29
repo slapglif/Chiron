@@ -1,8 +1,8 @@
-
 from typing import Dict
 
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
+from loguru import logger
 
 
 def plot_evaluation_metrics(
@@ -13,7 +13,7 @@ def plot_evaluation_metrics(
     text_class_f1: float,
 ) -> None:
     """
-    Visualize the evaluation metrics using Plotly.
+    Visualize the evaluation metrics using Plotly and log them as text.
 
     Args:
         evaluation_scores (Dict[str, float]): Evaluation scores from the model.
@@ -88,3 +88,21 @@ def plot_evaluation_metrics(
         title="Evaluation Metrics", showlegend=False, height=600, width=800
     )
     fig.show()
+
+    # Log the evaluation metrics as text
+    logger.info("Evaluation Metrics:")
+    logger.info("Model Evaluation Metrics:")
+    for metric, score in zip(metrics, scores):
+        logger.info(f"  {metric}: {score:.4f}")
+
+    logger.info("\nSemantic Similarity Prediction:")
+    logger.info(f"  Accuracy: {sem_sim_accuracy:.4f}")
+    logger.info(f"  F1 Score: {sem_sim_f1:.4f}")
+
+    logger.info("\nText Classification:")
+    logger.info(f"  Accuracy: {text_class_accuracy:.4f}")
+    logger.info(f"  F1 Score: {text_class_f1:.4f}")
+
+    logger.info("\nDownstream Tasks:")
+    for metric, score in zip(downstream_metrics, downstream_scores):
+        logger.info(f"  {metric}: {score:.4f}")

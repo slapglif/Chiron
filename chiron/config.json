@@ -2,31 +2,31 @@
   "dataset_params": {
     "dataset_name": "teknium/OpenHermes-2.5",
     "dataset_config": "default",
-    "split": "train[:5%]"
+    "split": "train[:1%]"
   },
   "preprocessing_params": {
     "min_freq": 5,
     "max_vocab_size": 10000
   },
   "embedding_params": {
-    "vector_size": 100,
-    "window": 3,
+    "vector_size": 200,
+    "window": 5,
     "min_count": 2,
-    "workers": 4
+    "workers": 8
   },
   "sdr_params": {
-    "pca_components": 5,
-    "sdr_dimensions": 64,
-    "sparsity": 0.05
+    "pca_components": 64,
+    "sdr_dimensions": 128,
+    "sparsity": 0.02
   },
   "htm_params": {
-    "input_size": 64,
-    "minicolumn_size": 8,
-    "potential_radius": 50,
-    "potential_pct": 0.3,
+    "input_size": 128,
+    "minicolumn_size": 16,
+    "potential_radius": 100,
+    "potential_pct": 0.5,
     "global_inhibition": true,
     "local_area_density": -1.0,
-    "num_active_columns_per_inhibition_area": 5,
+    "num_active_columns_per_inhibition_area": 10,
     "stimulus_threshold": 0.0,
     "syn_perm_inactive_dec": 0.01,
     "syn_perm_active_inc": 0.1,
@@ -37,44 +37,33 @@
     "seed": 42
   },
   "snn_params": {
-    "input_size": 64,
-    "hidden_size": 32,
-    "output_size": 64,
-    "timesteps": 5
+    "input_size": 132,
+    "hidden_size": 64,
+    "output_size": 128,
+    "timesteps": 10
   },
   "gat_params": {
-    "in_features": 64,
-    "out_features": 32,
-    "dropout": 0.4,
+    "in_features": 128,
+    "out_features": 64,
+    "num_heads": 2,
+    "dropout": 0.3,
     "alpha": 0.2,
     "concat": true
   },
-  "encoder_params": {
-    "d_model": 32,
-    "nhead": 2,
-    "num_layers": 2,
-    "dropout": 0.1
-  },
-  "decoder_params": {
-    "d_model": 32,
-    "nhead": 2,
-    "num_layers": 2,
-    "dropout": 0.1
-  },
   "device": "cuda:0",
-  "batch_size": 1024,
-  "num_epochs": 10,
+  "batch_size": 32,
+  "num_epochs": 20,
   "learning_rate": 0.0001,
   "adjacency_matrix": {
-    "threshold": 0.5,
-    "n_jobs": 10,
-    "batch_size": 512
+    "threshold": 0.7,
+    "subsample_rate": 0.05,
+    "n_jobs": 100,
+    "chunk_size": 2500
   },
   "labels": [],
-  "train_params": {
-    "num_epochs": 10,
-    "batch_size": 512,
-    "learning_rate": 0.0001,
-    "accumulation_steps": 4
-  }
+  "accumulation_steps": 8,
+  "checkpoint_dir": ".checkpoints",
+  "num_workers": 8,
+  "k_folds": 5,
+  "patience": 5
 }
