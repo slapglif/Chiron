@@ -1,15 +1,21 @@
 # main.py
 import argparse
+import concurrent
 import sys
+from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
+from typing import Dict, List, Any, Union
 
 import numpy as np
 import torch
 import torch.nn as nn
+from datasets import load_dataset as data_load
 from loguru import logger
 from sklearn.model_selection import KFold
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
-from transformers import BertTokenizer
+from tqdm import tqdm
+from transformers import LongformerTokenizer
 
 from chiron.evaluation.downstream_tasks import (
     semantic_similarity_prediction,
@@ -27,6 +33,20 @@ from chiron.utils.config import Config
 from chiron.utils.data import SemanticFoldingDataset
 
 
+def build_vocab(
+    preprocessed_conversations: List[List[str]], max_vocab_size: int
+) -> Dict[str, int]:
+    vocab = {"<PAD>": 0, "<UNK>": 1}
+    token_counts: Counter = count_token_frequencies(preprocessed_conversations)
+
+    for idx, (token, count) in enumerate(
+        token_counts.most_common(max_vocab_size - 2), start=2
+    ):
+        vocab[token] = idx
+
+    return vocab
+
+
 def main(config_path: str) -> None:
     """
     Main function to run the Semantic Folding training pipeline with k-fold cross-validation.
@@ -40,23 +60,19 @@ def main(config_path: str) -> None:
     # Set up TensorBoard writer
     writer = SummaryWriter(log_dir="runs")
 
-    # Load dataset
-    from datasets import load_dataset
-
-    dataset = load_dataset(
-        config["dataset_params"]["dataset_name"],
-        config["dataset_params"]["dataset_config"],
-        split=config["dataset_params"]["split"],
-    )
-    conversations = dataset["conversations"]
-    logger.info(f"Number of conversations: {len(conversations)}")
-
     # Preprocess text
     logger.info("Preprocessing text...")
     preprocessor = TextPreprocessor(**config["preprocessing_params"])
+
+    conversations = load_dataset(config)
+    # main.py
     preprocessed_conversations = preprocessor.preprocess(
         conversations, cache_key="preprocessed_conversations"
     )
+    preprocessed_conversations_flattened = [
+        token for conv in preprocessed_conversations for token in conv
+    ]
+
     logger.info(
         f"Number of preprocessed conversations: {len(preprocessed_conversations)}"
     )
@@ -66,7 +82,7 @@ def main(config_path: str) -> None:
     logger.info("Generating word embeddings...")
     embedding_model = Word2VecEmbedding(**config["embedding_params"])
     embeddings = embedding_model.generate_embeddings(
-        preprocessed_conversations, cache_key="embeddings"
+        preprocessed_conversations_flattened, cache_key="embeddings"
     )
     logger.info(f"Number of embeddings: {len(embeddings)}")
 
@@ -91,16 +107,16 @@ def main(config_path: str) -> None:
     )
 
     # Load the tokenizer
-    tokenizer = BertTokenizer.from_pretrained("bert-base-uncased")
+    tokenizer = LongformerTokenizer.from_pretrained("allenai/longformer-base-4096")
 
     # Create a vocabulary dictionary from the preprocessed conversations
     preprocessed_conversations = [
         [token] for conv in preprocessed_conversations for token in conv
     ]
 
-    vocab = {}
-    for token in set(token for conv in preprocessed_conversations for token in conv):
-        vocab[token] = len(vocab)
+    vocab = build_vocab(
+        preprocessed_conversations, max_vocab_size=preprocessor.max_vocab_size
+    )
 
     # Create dataset
     dataset = SemanticFoldingDataset(sdr_embeddings, tokenizer, labels=None)
@@ -142,14 +158,16 @@ def main(config_path: str) -> None:
         )
 
         logger.info(f"Creating SNN model for fold {fold + 1}...")
-        snn_model = SNNModel(
+        snn_model: Union[SNNModel, nn.DataParallel] = SNNModel(
             sp_params=config["sdr_params"],
-            snn_params=config["snn_params"],
+            longformer_params=config["longformer_params"],
             gat_params=config["gat_params"],
             htm_params=config["htm_params"],
             device=device,
             vocab=vocab,
             tokenizer=tokenizer,
+            max_sequence_length=config["max_sequence_length"],
+            snn_params=config["snn_params"],
         ).to(device)
 
         # Wrap the model with DataParallel for multi-GPU training
@@ -232,16 +250,17 @@ def main(config_path: str) -> None:
         predicted_texts = pipeline(input_text)
         logger.info(f"Predicted texts: {predicted_texts}")
 
-        if not config["labels"]:
-            semantic_sim_accuracy, semantic_sim_f1 = 0.0, 0.0
-            text_class_accuracy, text_class_f1 = 0.0, 0.0
-        else:
+        if config["labels"]:
             semantic_sim_accuracy, semantic_sim_f1 = semantic_similarity_prediction(
                 sdr_embeddings, config["labels"]
             )
             text_class_accuracy, text_class_f1 = text_classification(
                 sdr_embeddings, config["labels"]
             )
+        else:
+            semantic_sim_accuracy, semantic_sim_f1 = 0.0, 0.0
+            text_class_accuracy, text_class_f1 = 0.0, 0.0
+
         logger.info("Plotting evaluation metrics...")
         plot_evaluation_metrics(
             avg_metrics,
@@ -255,6 +274,55 @@ def main(config_path: str) -> None:
 
         # Close TensorBoard writer
         writer.close()
+
+
+def load_dataset(config: Config) -> List[List[Dict[str, Any]]]:
+    """
+    Load the dataset based on the configuration.
+
+    Args:
+        config (Config): The configuration object.
+
+    Returns:
+        List[List[Dict[str, Any]]]: The loaded dataset as a list of conversations,
+            where each conversation is a list of dictionaries representing individual turns.
+    """
+    dataset_params = config["dataset_params"]
+    dataset_name = dataset_params["dataset_name"]
+    dataset_config = dataset_params.get("dataset_config", None)
+    split = dataset_params["split"]
+
+    dataset = data_load(dataset_name, dataset_config, split=split)
+    conversations = dataset["conversations"]
+
+    return conversations
+
+
+def count_token_frequencies(tokenized_texts: List[List[str]]) -> Counter:
+    """
+    Count token frequencies in the tokenized texts using ThreadPoolExecutor.
+
+    Args:
+        tokenized_texts (List[List[str]]): List of tokenized texts.
+
+    Returns:
+        Counter: Token frequency counts.
+    """
+    with ThreadPoolExecutor() as executor:
+        futures = [
+            executor.submit(lambda: Counter(text))
+            for text in tqdm(tokenized_texts, desc="submitting tasks...")
+        ]
+
+        token_counts = Counter()
+        for future in tqdm(
+            concurrent.futures.as_completed(futures),
+            total=len(futures),
+            desc="Counting token frequencies",
+        ):
+            token_counts.update(future.result())
+
+    return token_counts
 
 
 if __name__ == "__main__":

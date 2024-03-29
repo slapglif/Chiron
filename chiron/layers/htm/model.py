@@ -255,9 +255,14 @@ class HTMSpatialPooler:
         """
         Update the boosting factors of the minicolumns.
         """
-        self.boosting_factors = np.exp(
-            self.max_boost * (self.min_overlap_duty_cycles - self.overlap_duty_cycles)
-        )  # noqa: E501
+        self.boosting_factors = np.clip(
+            np.exp2(
+                self.max_boost
+                * (self.min_overlap_duty_cycles - self.overlap_duty_cycles)
+            ),
+            1.0,
+            self.max_boost,
+        )
 
     def compute(self, input_vector: np.ndarray) -> np.ndarray:
         """

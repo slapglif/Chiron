@@ -2,6 +2,7 @@ from typing import Any, Dict, List
 
 import numpy as np
 import torch
+from loguru import logger
 from nltk.translate.bleu_score import corpus_bleu
 from numpy import ndarray
 from rouge_score import rouge_scorer
@@ -166,7 +167,8 @@ def evaluate_text_prediction(
             )
 
             # Decode the generated text
-            generated_text = tokenizer.decode(output_ids[0], skip_special_tokens=True)
+            logger.debug(f"output_ids: {output_ids}")
+            generated_text = output_ids[0][0]
             generated_texts.append(generated_text)
 
             # Decode the reference text

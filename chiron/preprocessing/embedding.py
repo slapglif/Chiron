@@ -33,26 +33,84 @@ class Word2VecEmbedding:
         )
 
     def generate_embeddings(
-        self, tokenized_texts: List[List[str]], cache_key: str, batch_size: int = 1000
+        self,
+        preprocessed_conversations: List[List[str]],
+        cache_key: str,
+        batch_size: int = 1000,
     ) -> List[List[np.ndarray]]:
         """
-        Generate Word2Vec embeddings for the given tokenized texts using threading and batch processing.
+        Generate Word2Vec embeddings for the given preprocessed conversations using threading and batch processing.
 
         Args:
-            tokenized_texts (List[List[str]]): List of tokenized texts.
+            preprocessed_conversations (List[List[str]]): List of preprocessed conversations.
             cache_key (str): Key to use for caching the generated embeddings.
-            batch_size (int): Number of texts to process in each batch (default: 1000).
+            batch_size (int): Number of conversations to process in each batch (default: 1000).
 
         Returns:
-            List[List[np.ndarray]]: List of word embeddings for each text.
+            List[List[np.ndarray]]: List of word embeddings for each conversation.
         """
         embeddings = load_cached_data(cache_key)
         if embeddings is None:
             embeddings: list = self._generate_embeddings_parallel(
-                tokenized_texts, batch_size
+                preprocessed_conversations, batch_size
             )
             cache_data(embeddings, cache_key)
         return embeddings
+
+    def _generate_embeddings_parallel(
+        self, preprocessed_conversations: List[List[str]], batch_size: int
+    ) -> List[List[np.ndarray]]:
+        """
+        Generate Word2Vec embeddings in parallel using multithreading.
+
+        Args:
+            preprocessed_conversations (List[List[str]]): List of preprocessed conversations.
+            batch_size (int): Number of conversations to process in each batch.
+
+        Returns:
+            List[List[np.ndarray]]: List of word embeddings for each conversation.
+        """
+        total_conversations = len(preprocessed_conversations)
+        batches = [
+            preprocessed_conversations[i : i + batch_size]
+            for i in range(0, total_conversations, batch_size)
+        ]
+
+        with ThreadPoolExecutor(max_workers=self.workers) as executor:
+            futures = [
+                executor.submit(self._process_batch, batch)
+                for batch in tqdm(batches, desc="submitting tasks...")
+            ]
+            embeddings = [
+                future.result()
+                for future in tqdm(
+                    as_completed(futures),
+                    total=len(futures),
+                    desc="Generating word embedding batches...",
+                )
+            ]
+
+        embeddings = [embedding for batch in embeddings for embedding in batch]
+        return embeddings
+
+    def _process_batch(self, batch: List[List[str]]) -> List[List[np.ndarray]]:
+        """
+        Process a batch of preprocessed conversations and generate embeddings.
+
+        Args:
+            batch (List[List[str]]): Batch of preprocessed conversations.
+
+        Returns:
+            List[List[np.ndarray]]: List of word embeddings for each conversation in the batch.
+        """
+        batch_embeddings = []
+        for conversation in batch:
+            text_embeddings = []
+            for token in conversation:
+                if token in self.model:
+                    text_embeddings.append(self.model[token])
+            batch_embeddings.append(text_embeddings)
+        return batch_embeddings
 
     def _generate_embeddings_parallel(
         self, tokenized_texts: List[List[str]], batch_size: int

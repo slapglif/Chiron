@@ -1,6 +1,7 @@
 import concurrent.futures
 import random
-from typing import List, Optional, Tuple
+from typing import List, Tuple
+from typing import Optional
 
 import faiss
 import numpy as np
@@ -8,7 +9,7 @@ import torch
 import torch.nn as nn
 from loguru import logger
 from tqdm import tqdm
-from transformers import PreTrainedTokenizer
+from transformers import LongformerModel, LongformerTokenizer, LongformerConfig
 
 from chiron.layers.htm.model import HTMModel
 from chiron.layers.snn.graph_attention import GraphAttentionLayer
@@ -187,7 +188,11 @@ class SNNLayer(nn.Module):
             # Pad input_ids with zeros to match the expected input_size
             padding_size = self.input_size - input_ids.size(-1)
             input_ids = torch.cat(
-                [input_ids, torch.zeros(input_ids.size(0), padding_size, device=self.device)], dim=-1
+                [
+                    input_ids,
+                    torch.zeros(input_ids.size(0), padding_size, device=self.device),
+                ],
+                dim=-1,
             )
         input_ids = input_ids.view(-1, self.input_size)
 
@@ -239,27 +244,103 @@ class SNNLayer(nn.Module):
         return output
 
 
+class LongformerLayer(nn.Module):
+    """
+    Longformer layer implementation for handling long sequences.
+
+    Args:
+        hidden_size (int): The hidden size of the Longformer model.
+        num_layers (int): The number of Longformer layers.
+        num_heads (int): The number of attention heads.
+        max_length (int): The maximum sequence length.
+        dropout (float): The dropout probability. Default is 0.1.
+    """
+
+    def __init__(
+        self,
+        hidden_size: int,
+        num_layers: int,
+        num_heads: int,
+        max_length: int,
+        dropout: float = 0.1,
+    ):
+        super(LongformerLayer, self).__init__()
+        self.hidden_size = hidden_size
+        self.num_layers = num_layers
+        self.num_heads = num_heads
+        self.max_length = max_length
+        self.dropout = dropout
+
+        # Initialize the Longformer model
+        self.longformer = LongformerModel(
+            config=LongformerConfig(
+                hidden_size=hidden_size,
+                num_hidden_layers=num_layers,
+                num_attention_heads=num_heads,
+                max_position_embeddings=max_length,
+                hidden_dropout_prob=dropout,
+                attention_probs_dropout_prob=dropout,
+            )
+        )
+
+    def forward(
+        self, input_ids: torch.Tensor, attention_mask: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Perform forward pass of the LongformerLayer.
+
+        Args:
+            input_ids (torch.Tensor): Input token IDs of shape (batch_size, seq_len).
+            attention_mask (torch.Tensor): Attention mask of shape (batch_size, seq_len).
+
+        Returns:
+            torch.Tensor: Output tensor of shape (batch_size, seq_len, hidden_size).
+        """
+        # Ensure input_ids and attention_mask have the correct shape
+        assert (
+            input_ids.shape == attention_mask.shape
+        ), "Input IDs and attention mask must have the same shape"
+
+        # Forward pass through the Longformer model
+        outputs = self.longformer(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+        )
+
+        # Extract the last hidden state
+        last_hidden_state = outputs.last_hidden_state
+
+        return last_hidden_state
+
+
 class SNNModel(nn.Module):
     """
-    Spiking Neural Network model integrating HTM and Graph Attention layers.
+    Spiking Neural Network model integrating Longformer, SNNLayer, and Graph Attention layers.
 
     Args:
         sp_params (dict): Parameters for the spatial pooling layer.
-        snn_params (dict): Parameters for the SNN layer.
+        longformer_params (dict): Parameters for the Longformer layer.
+        snn_params (dict): Parameters for the SNNLayer.
         gat_params (dict): Parameters for the Graph Attention layer.
         htm_params (dict): Parameters for the HTM layer.
         device (torch.device): The device to run the model on.
         vocab (dict): The vocabulary mapping for token to index.
+        tokenizer (LongformerTokenizer): The Longformer tokenizer.
+        max_sequence_length (int): The maximum sequence length.
 
     Attributes:
         sp_params (dict): Spatial pooling parameters.
-        snn_params (dict): SNN layer parameters.
+        longformer_params (dict): Longformer layer parameters.
+        snn_params (dict): SNNLayer parameters.
         gat_params (dict): Graph Attention layer parameters.
         htm_params (dict): HTM layer parameters.
         device (torch.device): Computation device.
         vocab (dict): Vocabulary mapping.
+        tokenizer (LongformerTokenizer): Longformer tokenizer.
+        max_sequence_length (int): Maximum sequence length.
         output_size (int): Output size derived from `sp_params`.
-        snn_layer (SNNLayer): The SNN layer of the model.
+        longformer_layer (LongformerLayer): The Longformer layer of the model.
+        snn_layer (SNNLayer): The SNNLayer of the model.
         gat_layer (GraphAttentionLayer): The GAT layer of the model.
         htm_layer (HTMModel): The HTM layer of the model.
         fc_out (nn.Linear): Final fully connected layer.
@@ -268,28 +349,36 @@ class SNNModel(nn.Module):
     def __init__(
         self,
         sp_params: dict,
+        longformer_params: dict,
         snn_params: dict,
         gat_params: dict,
         htm_params: dict,
         device: torch.device,
         vocab: dict,
-        tokenizer: PreTrainedTokenizer,
-        max_sequence_length: int = 1000000,
+        tokenizer: LongformerTokenizer,
+        max_sequence_length: int,
     ):
         super(SNNModel, self).__init__()
         self.sp_params = sp_params
+        self.longformer_params = longformer_params
         self.snn_params = snn_params
         self.gat_params = gat_params
         self.htm_params = htm_params
         self.device = device
         self.vocab = vocab
         self.tokenizer = tokenizer
-        self.eos_token_id = self.tokenizer.eos_token_id
         self.max_sequence_length = max_sequence_length
 
         self.output_size = sp_params["sdr_dimensions"]
+        self.longformer_layer = LongformerLayer(
+            hidden_size=longformer_params["hidden_size"],
+            num_layers=longformer_params["num_layers"],
+            num_heads=longformer_params["num_heads"],
+            max_length=max_sequence_length,
+            dropout=longformer_params.get("dropout", 0.1),
+        ).to(device)
         self.snn_layer = SNNLayer(
-            input_size=max_sequence_length,
+            input_size=longformer_params["hidden_size"],
             hidden_size=snn_params["hidden_size"],
             output_size=snn_params["output_size"],
             timesteps=snn_params["timesteps"],
@@ -311,8 +400,8 @@ class SNNModel(nn.Module):
         self.fc_out = nn.Linear(self.output_size, self.output_size).to(device)
 
         logger.info(
-            f"SNNModel initialized with sp_params={sp_params}, snn_params={snn_params},"
-            f"gat_params={gat_params}, htm_params={htm_params}, output_size={self.output_size}"
+            f"SNNModel initialized with sp_params={sp_params}, longformer_params={longformer_params},"
+            f"snn_params={snn_params}, gat_params={gat_params}, htm_params={htm_params}, output_size={self.output_size}"
         )
 
     def forward(
@@ -326,64 +415,46 @@ class SNNModel(nn.Module):
         Perform forward pass of the SNNModel.
 
         Args:
-            input_ids (torch.Tensor): Input tensor of shape (batch_size, seq_len, input_size) or (batch_size, input_size).
-            attention_mask (torch.Tensor): Attention mask tensor of shape (batch_size, seq_len, input_size) or (batch_size, input_size).
+            input_ids (torch.Tensor): Input token IDs of shape (batch_size, seq_len).
+            attention_mask (torch.Tensor): Attention mask of shape (batch_size, seq_len).
             adj_matrix (torch.sparse_coo_tensor): Adjacency matrix in sparse COO format.
             node_indices (Optional[torch.Tensor]): Tensor of node indices. Default is None.
 
         Returns:
             torch.Tensor: Output tensor of shape (batch_size, output_size).
         """
-        if input_ids.ndim == 1:
-            input_ids = input_ids.unsqueeze(0)
-            attention_mask = attention_mask.unsqueeze(0)
+        # Forward pass through the Longformer layer
+        longformer_output = self.longformer_layer(input_ids, attention_mask)
+        logger.debug(f"Longformer output shape: {longformer_output.shape}")
 
-        if input_ids.ndim == 2:
-            input_ids = input_ids.unsqueeze(1)
-            attention_mask = attention_mask.unsqueeze(1)
+        # Implement chunking mechanism
+        chunk_size = 512  # Adjust the chunk size based on available memory
+        output_chunks = []
 
-        batch_size, seq_len, input_size = input_ids.size()
+        for i in range(0, longformer_output.size(1), chunk_size):
+            chunk_longformer_output = longformer_output[:, i : i + chunk_size, :]
 
-        if seq_len == 1:
-            input_ids = input_ids.squeeze(1)
-            attention_mask = attention_mask.squeeze(1)
+            # Forward pass through the SNNLayer
+            chunk_snn_output = self.snn_layer(
+                chunk_longformer_output, None, adj_matrix, node_indices
+            )
+            logger.debug(f"SNNLayer output shape: {chunk_snn_output.shape}")
 
-        assert seq_len == 1, "Input tensor should have a sequence length of 1"
+            # Reshape the SNNLayer output tensor
+            chunk_snn_output = chunk_snn_output.view(chunk_snn_output.size(0), 1, -1)
+            logger.debug(f"Reshaped SNNLayer output shape: {chunk_snn_output.shape}")
 
-        # Check if input_ids and attention_mask are empty tensors
-        if input_ids.numel() == 0 and attention_mask.numel() == 0:
-            logger.warning("Received empty input tensors. Returning zeros output.")
-            return torch.zeros(batch_size, self.output_size, device=self.device)
+            output_chunks.append(chunk_snn_output)
 
-        # Move the input tensors to the specified device
-        input_ids = input_ids.to(self.device)
-        attention_mask = attention_mask.to(self.device)
-
-        # Ensure the input tensors are in float format
-        input_ids = input_ids.float()
-        attention_mask = attention_mask.float()
-
-        logger.debug(f"Input tensor shape: {input_ids.shape}")
-        logger.debug(f"Attention mask shape: {attention_mask.shape}")
-        if adj_matrix is not None:
-            logger.debug(f"Adjacency matrix shape: {adj_matrix.shape}")
-        if node_indices is not None:
-            logger.debug(f"Node indices shape: {node_indices.shape}")
-
-        # Forward pass through the SNN layer
-        snn_output = self.snn_layer(input_ids, attention_mask, adj_matrix, node_indices)
-        logger.debug(f"SNN output shape: {snn_output.shape}")
-
-        # Reshape the SNN output tensor
-        snn_output = snn_output.view(snn_output.size(0), 1, -1)
-        logger.debug(f"Reshaped SNN output shape: {snn_output.shape}")
+        snn_output = torch.cat(output_chunks, dim=1)
+        logger.debug(f"Concatenated SNNLayer output shape: {snn_output.shape}")
 
         # Forward pass through the GAT layer
         gat_output = self.gat_layer(snn_output)
         logger.debug(f"GAT output shape: {gat_output.shape}")
 
         # Forward pass through the HTM layer
-        htm_output = self.htm_layer(gat_output).view(batch_size, -1)
+        htm_output = self.htm_layer(gat_output).view(gat_output.size(0), -1)
         logger.debug(f"HTM output shape: {htm_output.shape}")
 
         # Final fully connected layer
@@ -391,196 +462,3 @@ class SNNModel(nn.Module):
         logger.debug(f"Final output shape: {output.shape}")
 
         return output
-
-    def generate(
-        self,
-        input_conversation: List[str],
-        max_length: int = 100,
-        num_return_sequences: int = 1,
-        temperature: float = 0.7,
-        top_k: int = 50,
-        top_p: float = 0.9,
-        mirostat_eta: float = 0.1,
-        mirostat_tau: float = 5.0,
-        adjacency_matrix_sparse: Optional[torch.Tensor] = None,
-    ) -> List[List[str]]:
-        """
-        Generate responses based on the input conversation.
-
-        Args:
-            input_conversation (List[str]): The input conversation as a list of strings.
-            max_length (int): The maximum length of the generated response. Default is 100.
-            num_return_sequences (int): The number of responses to generate. Default is 1.
-            temperature (float): The temperature for sampling. Default is 0.7.
-            top_k (int): The number of top-k tokens to consider for filtering. Default is 50.
-            top_p (float): The cumulative probability threshold for filtering. Default is 0.9.
-            mirostat_eta (float): The learning rate for Mirostat. Default is 0.1.
-            mirostat_tau (float): The target entropy for Mirostat. Default is 5.0.
-            adjacency_matrix_sparse (Optional[torch.Tensor]): The adjacency matrix in sparse tensor format. Default is None.
-
-        Returns:
-            List[List[str]]: The list of generated conversations, where each conversation is a list of strings.
-        """
-        generated_conversations = []
-
-        # Convert the input conversation to a list of strings
-        string_conversation = [str(turn) for turn in input_conversation]
-
-        # Check if the input conversation is empty
-        if not string_conversation:
-            logger.warning(
-                "Input conversation is empty. Returning empty generated conversations."
-            )
-            return generated_conversations
-
-        for _ in range(num_return_sequences):
-            generated_conversation = []
-            input_text = " ".join(string_conversation)
-            generated_conversation.append(input_text)
-
-            # Initialize Mirostat parameters
-            mirostat_mu = 2.0 * mirostat_tau
-            mirostat_s = 1.0
-
-            # Prepare the input for the model
-            model_input = self._prepare_input(generated_conversation)
-            input_ids = model_input["input_ids"]
-            attention_mask = model_input["attention_mask"]
-
-            response = []
-            while len(response) < max_length:
-                # Forward pass
-                model_output = self.forward(
-                    input_ids,
-                    attention_mask,
-                    adjacency_matrix_sparse
-                    if adjacency_matrix_sparse is not None
-                    else torch.empty(0, dtype=torch.float32, device=self.device),
-                    node_indices=None,
-                )
-
-                # Ensure model_output has the expected shape
-                if model_output.dim() == 2:
-                    model_output = model_output.unsqueeze(1)  # Add a sequence dimension
-
-                # Sample from the model's output distribution
-                output_logits = model_output[:, -1, :] / temperature
-                filtered_logits = self._top_k_top_p_filtering(
-                    output_logits, top_k=top_k, top_p=top_p
-                )
-                probabilities = torch.softmax(filtered_logits, dim=-1)
-                next_token = torch.multinomial(probabilities, num_samples=1)
-
-                # Update Mirostat parameters
-                mirostat_s = (
-                    mirostat_eta * (output_logits.max().item() - mirostat_tau)
-                    + (1 - mirostat_eta) * mirostat_s
-                )
-                mirostat_mu = mirostat_mu * torch.exp(mirostat_s)
-                temperature = max(0.1, temperature * (mirostat_tau / mirostat_mu))
-
-                if next_token.item() == self.eos_token_id:
-                    break
-
-                response.append(next_token.item())
-                model_input = self._prepare_input(
-                    generated_conversation + [self.tokenizer.decode(response)]
-                )
-                input_ids = model_input["input_ids"]
-                attention_mask = model_input["attention_mask"]
-
-            generated_response = self.tokenizer.decode(response)
-            generated_conversation.append(generated_response)
-            generated_conversations.append(generated_conversation)
-
-        return generated_conversations
-
-    def _prepare_input(self, conversation: list) -> dict:
-        """
-        Prepare the input for the model based on the conversation structure.
-
-        Args:
-            conversation (list): The conversation as a list of strings.
-
-        Returns:
-            dict: The prepared input for the model.
-        """
-        input_ids = []
-        attention_mask = []
-
-        for turn in conversation:
-            if isinstance(turn, str):
-                encoded_turn = self.tokenizer.encode(turn, add_special_tokens=False)
-                if encoded_turn:
-                    input_ids.extend(encoded_turn + [self.tokenizer.eos_token_id])
-                    attention_mask.extend([1] * (len(encoded_turn) + 1))
-            elif turn is None:
-                continue
-            else:
-                raise ValueError(f"Unexpected type for turn: {type(turn)}")
-
-        # Remove None values from input_ids
-        input_ids = [token for token in input_ids if token is not None]
-
-        # Truncate input_ids and attention_mask if they exceed the maximum sequence length
-        if len(input_ids) > self.max_sequence_length:
-            input_ids = input_ids[: self.max_sequence_length]
-            attention_mask = attention_mask[: self.max_sequence_length]
-
-        if input_ids:
-            input_ids = torch.tensor(input_ids, dtype=torch.long)
-            attention_mask = torch.tensor(attention_mask, dtype=torch.long)
-            return {"input_ids": input_ids, "attention_mask": attention_mask}
-        else:
-            logger.warning(
-                "No valid turns found in the conversation. Returning empty input."
-            )
-            empty_tensor = torch.tensor([], dtype=torch.long)
-            return {"input_ids": empty_tensor, "attention_mask": empty_tensor}
-
-    @staticmethod
-    def _top_k_top_p_filtering(
-        logits: torch.Tensor,
-        top_k: int = 0,
-        top_p: float = 1.0,
-        filter_value: float = -float("Inf"),
-    ) -> torch.Tensor:
-        """
-        Filter a distribution of logits using top-k and/or nucleus (top-p) filtering.
-
-        Args:
-            logits (torch.Tensor): Logits distribution shape (batch size, vocabulary size).
-            top_k (int): Keep only top k tokens with highest probability (top-k filtering).
-            top_p (float): Keep the top tokens with cumulative probability >= top_p (nucleus filtering).
-            filter_value (float): Value to use for filtered logits.
-
-        Returns:
-            torch.Tensor: Filtered logits.
-        """
-        assert (
-            logits.dim() == 1
-        )  # Batch size 1 for now - could be updated for more but the code would be less clear
-        top_k = min(top_k, logits.size(-1))  # Safety check
-        if top_k > 0:
-            # Remove all tokens with a probability less than the last token of the top-k
-            indices_to_remove = logits < torch.topk(logits, top_k)[0][..., -1, None]
-            logits[indices_to_remove] = filter_value
-
-        if top_p < 1.0:
-            sorted_logits, sorted_indices = torch.sort(logits, descending=True)
-            cumulative_probs = torch.cumsum(
-                torch.softmax(sorted_logits, dim=-1), dim=-1
-            )
-
-            # Remove tokens with cumulative probability above the threshold
-            sorted_indices_to_remove = cumulative_probs > top_p
-            # Shift the indices to the right to keep also the first token above the threshold
-            sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[
-                ..., :-1
-            ].clone()
-            sorted_indices_to_remove[..., 0] = 0
-
-            indices_to_remove = sorted_indices[sorted_indices_to_remove]
-            logits[indices_to_remove] = filter_value
-
-        return logits

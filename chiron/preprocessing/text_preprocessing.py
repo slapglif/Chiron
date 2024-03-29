@@ -8,7 +8,7 @@ from loguru import logger
 from nltk.corpus import wordnet
 from tqdm import tqdm
 
-from chiron.utils.cache import load_cached_data, cache_data
+from chiron.utils.cache import cache_data, load_cached_data
 
 
 class TextPreprocessor:
@@ -35,22 +35,6 @@ class TextPreprocessor:
             self.vocab.get(token, self.vocab.get("<UNK>", 0))
             for token in tokenized_texts
         ]
-
-    @staticmethod
-    def preprocess_text(text: str) -> str:
-        """
-        Preprocess the input text by lowercasing, removing punctuation, and handling special characters.
-
-        Args:
-            text (str): Input text.
-
-        Returns:
-            str: Preprocessed text.
-        """
-        text = text.lower()
-        text = re.sub(r"[^\w\s]", "", text)
-        text = re.sub(r"\d", "<NUM>", text)
-        return text
 
     @staticmethod
     def tokenize_text(text: str) -> List[str]:
@@ -185,9 +169,40 @@ class TextPreprocessor:
 
         return preprocessed_batch
 
-    def preprocess(self, texts: Dict[str, Any], cache_key: str) -> List[List[str]]:
+    # chiron/preprocessing/text_preprocessing.py
+    def preprocess(
+        self, conversations: List[List[Dict[str, Any]]], cache_key: str
+    ) -> List[List[str]]:
         preprocessed_data = load_cached_data(cache_key)
         if preprocessed_data is None:
-            preprocessed_data = self.preprocess_text_batch(texts)
+            preprocessed_data = []
+            for conversation in conversations:
+                preprocessed_conversation = []
+                for turn in conversation:
+                    text = turn["value"]
+                    preprocessed_text = self.preprocess_text(text)
+                    preprocessed_conversation.append(preprocessed_text)
+                preprocessed_data.append(preprocessed_conversation)
             cache_data(preprocessed_data, cache_key)
         return preprocessed_data
+
+    def preprocess_text(self, text: str) -> List[str]:
+        """
+        Preprocess a single text by lowercasing, removing punctuation, and handling special characters.
+
+        Args:
+            text (str): Input text.
+
+        Returns:
+            List[str]: Preprocessed text as a list of tokens.
+        """
+        preprocessed_text = self.preprocess_text_helper(text)
+        augmented_text = self.augment_text(preprocessed_text)
+        tokenized_text = self.tokenize_text(augmented_text)
+        return tokenized_text
+
+    def preprocess_text_helper(self, text: str) -> str:
+        text = text.lower()
+        text = re.sub(r"[^\w\s]", "", text)
+        text = re.sub(r"\d", "<NUM>", text)
+        return text

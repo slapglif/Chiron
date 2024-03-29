@@ -4,6 +4,14 @@
     "dataset_config": "default",
     "split": "train[:1%]"
   },
+  "longformer_params": {
+    "hidden_size": 768,
+    "num_layers": 12,
+    "num_heads": 12,
+    "dropout": 0.1,
+    "attention_probs_dropout_prob": 0.1
+  },
+  "max_sequence_length": 1000000,
   "preprocessing_params": {
     "min_freq": 5,
     "max_vocab_size": 10000
@@ -51,17 +59,17 @@
     "concat": true
   },
   "device": "cuda:0",
-  "batch_size": 32,
+  "batch_size": 512,
   "num_epochs": 20,
   "learning_rate": 0.0001,
   "adjacency_matrix": {
     "threshold": 0.7,
     "subsample_rate": 0.05,
     "n_jobs": 100,
-    "chunk_size": 2500
+    "chunk_size": 10000
   },
   "labels": [],
-  "accumulation_steps": 8,
+  "accumulation_steps": 16,
   "checkpoint_dir": ".checkpoints",
   "num_workers": 8,
   "k_folds": 5,
