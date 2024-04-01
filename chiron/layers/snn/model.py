@@ -1,118 +1,137 @@
-import concurrent.futures
-import random
-from typing import List, Tuple
-from typing import Optional
-
-import faiss
-import numpy as np
+# chiron/layers/snn/model.py
 import torch
 import torch.nn as nn
 from loguru import logger
 from tqdm import tqdm
-from transformers import LongformerModel, LongformerTokenizer, LongformerConfig
+from transformers import PreTrainedTokenizer
 
 from chiron.layers.htm.model import HTMModel
 from chiron.layers.snn.graph_attention import GraphAttentionLayer
 
 
-def process_chunk(
-    sdr_embeddings: np.ndarray,
-    chunk_start: int,
-    chunk_end: int,
-    search_k: int,
-    subsample_rate: float,
-    threshold: float,
-) -> List[Tuple[int, int]]:
+def batch_cosine_similarity(
+    sdr_embeddings: torch.Tensor, threshold: float = 0.5, batch_size: int = 1000
+) -> torch.Tensor:
     """
-    Finds neighbors within a certain threshold for a chunk of data.
+    Computes cosine similarity in batches and directly produces a sparse matrix to avoid memory overflow.
 
     Args:
-        sdr_embeddings (np.ndarray): The SDR embeddings.
-        chunk_start (int): The start index of the chunk.
-        chunk_end (int): The end index of the chunk.
-        search_k (int): Number of neighbors to consider.
-        subsample_rate (float): Rate of subsampling to reduce connections.
-        threshold (float): Threshold for considering two nodes as neighbors.
+        sdr_embeddings (torch.Tensor): SDR embeddings of shape (N, D) where N is the number of embeddings and D is the dimension.
+        threshold (float): Cosine similarity threshold to consider two vectors as connected.
+        batch_size (int): The size of each batch for computation.
 
     Returns:
-        List[Tuple[int, int]]: List of neighbor pairs.
+        torch.sparse.Tensor: A sparse matrix of cosine similarities above the threshold.
     """
-    chunk_adjacency_list = []
-    index = faiss.IndexFlatL2(sdr_embeddings.shape[1])
-    index.add(sdr_embeddings)
+    num_embeddings = sdr_embeddings.size(0)
+    device = sdr_embeddings.device
 
-    for idx in range(chunk_start, chunk_end):
-        _, neighbor_indices = index.search(
-            np.expand_dims(sdr_embeddings[idx], axis=0), search_k
-        )
-        for neighbor_idx in neighbor_indices[0]:
-            if idx != neighbor_idx and random.random() < subsample_rate:
-                dist = np.linalg.norm(
-                    sdr_embeddings[idx] - sdr_embeddings[neighbor_idx]
-                )
-                if dist < threshold:
-                    chunk_adjacency_list.append((idx, neighbor_idx))
+    indices = []
+    values = []
 
-    return chunk_adjacency_list
+    for i in tqdm(
+        range(0, num_embeddings, batch_size), desc="Computing cosine similarity"
+    ):
+        batch_end = min(i + batch_size, num_embeddings)
+        batch = sdr_embeddings[i:batch_end]
+
+        # Efficient computation of cosine similarity using matrix multiplication
+        similarity = torch.mm(batch, sdr_embeddings.t())
+
+        # Convert to sparse format immediately to save memory
+        batch_indices = torch.nonzero(similarity > threshold, as_tuple=False).t()
+        batch_values = similarity[similarity > threshold]
+
+        # Adjust indices for the current batch
+        batch_indices[0] += i
+
+        indices.append(batch_indices)
+        values.append(batch_values)
+
+    # Concatenate all indices and values
+    indices = torch.cat(indices, dim=1)
+    values = torch.cat(values, dim=0)
+
+    # Create the final sparse matrix
+    similarity_matrix_sparse = torch.sparse_coo_tensor(
+        indices,
+        values,
+        (num_embeddings, num_embeddings),
+        device=device,
+    )
+
+    return similarity_matrix_sparse
 
 
 def create_adjacency_matrix(
-    sdr_embeddings: np.ndarray,
-    threshold: float = 0.5,
-    subsample_rate: float = 0.1,
-    search_k: int = 1000,
-    n_jobs: int = -1,
-    chunk_size: int = 2500,
-    device: torch.device = torch.device("cuda:0"),
-) -> torch.Tensor:
+    sdr_embeddings: torch.Tensor, threshold: float = 0.5
+) -> torch.sparse.Tensor:
     """
-    Creates a sparse adjacency matrix for the SDR embeddings using FAISS.
+    Generates an adjacency matrix from SDR embeddings using cosine similarity.
 
     Args:
-        sdr_embeddings (np.ndarray): The SDR embeddings.
-        threshold (float): Threshold for considering two nodes as neighbors.
-        subsample_rate (float): Subsampling rate to reduce connections.
-        search_k (int): Number of neighbors to consider.
-        n_jobs (int): Number of parallel jobs to run.
-        chunk_size (int): Size of each chunk to process in parallel.
-        device (torch.device): The device to create the adjacency matrix on.
+        sdr_embeddings (torch.Tensor): The SDR embeddings tensor of shape (N, D).
+        threshold (float): Threshold for considering two embeddings as neighbors.
 
     Returns:
-        torch.Tensor: The sparse adjacency matrix.
+        torch.sparse.Tensor: The adjacency matrix as a sparse COO tensor.
     """
-    num_nodes = sdr_embeddings.shape[0]
-    adjacency_list = []
+    # Normalize embeddings to unit vectors for cosine similarity calculation
+    sdr_embeddings = sdr_embeddings / sdr_embeddings.norm(dim=1, keepdim=True)
 
-    with tqdm(
-        total=num_nodes, desc="Building adjacency matrix", unit="node"
-    ) as progress_bar:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=n_jobs) as executor:
-            futures = []
-            for chunk_start in range(0, num_nodes, chunk_size):
-                chunk_end = min(chunk_start + chunk_size, num_nodes)
-                futures.append(
-                    executor.submit(
-                        process_chunk,
-                        sdr_embeddings,
-                        chunk_start,
-                        chunk_end,
-                        search_k,
-                        subsample_rate,
-                        threshold,
-                    )
-                )
+    # Compute cosine similarity matrix
+    similarity_matrix = torch.matmul(sdr_embeddings, sdr_embeddings.t())
 
-            for future in concurrent.futures.as_completed(futures):
-                adjacency_list.extend(future.result())
-                progress_bar.update(chunk_size)
+    # Apply threshold to create a binary adjacency matrix
+    adjacency_matrix = (similarity_matrix > threshold).float()
 
-    rows, cols = zip(*adjacency_list)
-    values = np.ones(len(rows), dtype=np.float32)
+    # Convert the adjacency matrix to a sparse COO tensor
+    indices = torch.nonzero(adjacency_matrix).t()
+    values = adjacency_matrix[indices[0], indices[1]]
     adjacency_matrix_sparse = torch.sparse_coo_tensor(
-        torch.tensor([rows, cols], dtype=torch.long),
-        torch.tensor(values),
-        (num_nodes, num_nodes),
-        device=device,
+        indices, values, adjacency_matrix.size()
+    )
+
+    return adjacency_matrix_sparse
+
+
+def create_adjacency_matrix_batched(
+    sdr_embeddings: torch.Tensor, threshold: float = 0.5, batch_size: int = 10000
+) -> torch.sparse.Tensor:
+    num_embeddings = sdr_embeddings.size(0)
+    indices = []
+    values = []
+
+    # Normalize embeddings to unit vectors for cosine similarity calculation
+    sdr_embeddings = sdr_embeddings / sdr_embeddings.norm(dim=1, keepdim=True)
+
+    num_batches = (num_embeddings + batch_size - 1) // batch_size
+    progress_bar = tqdm(total=num_batches, desc="Computing adjacency matrix")
+
+    for i in range(0, num_embeddings, batch_size):
+        batch_end = min(i + batch_size, num_embeddings)
+        batch_embeddings = sdr_embeddings[i:batch_end]
+
+        # Compute cosine similarity for the current batch
+        similarity_matrix = torch.einsum("nd,md->nm", batch_embeddings, sdr_embeddings)
+
+        # Apply threshold and convert to sparse format
+        batch_indices = torch.nonzero(similarity_matrix > threshold).t()
+        batch_values = similarity_matrix[batch_indices[0], batch_indices[1]]
+
+        indices.append(batch_indices)
+        values.append(batch_values)
+
+        progress_bar.update(1)
+
+    progress_bar.close()
+
+    # Concatenate indices and values from all batches
+    indices = torch.cat(indices, dim=1)
+    values = torch.cat(values)
+
+    adjacency_matrix_sparse = torch.sparse_coo_tensor(
+        indices, values, (num_embeddings, num_embeddings)
     )
 
     return adjacency_matrix_sparse
@@ -120,288 +139,124 @@ def create_adjacency_matrix(
 
 class SNNLayer(nn.Module):
     """
-    Spiking Neural Network layer implementation.
-
-    Args:
-        input_size (int): The number of input features.
-        hidden_size (int): The number of hidden units.
-        output_size (int): The number of output features.
-        timesteps (int): The number of timesteps to unroll the layer for.
-        num_nodes (int): The number of nodes in the graph.
-        dropout (float): The dropout probability. Default is 0.0.
-        device (torch.device): The device to run the computation on. Default is torch.device("cuda:0").
+    Spiking Neural Network (SNN) layer.
     """
 
     def __init__(
         self,
-        input_size: int,
         hidden_size: int,
         output_size: int,
         timesteps: int,
-        num_nodes: int = 1,
+        num_nodes: int,
         dropout: float = 0.0,
-        device: torch.device = torch.device("cuda:0"),
     ):
         super(SNNLayer, self).__init__()
-        self.input_size = input_size
         self.hidden_size = hidden_size
         self.output_size = output_size
         self.timesteps = timesteps
         self.num_nodes = num_nodes
         self.dropout = dropout
-        self.device = device
-
-        # Initialize the fully connected layers
-        self.fc1 = nn.Linear(input_size, hidden_size).to(device)
-        self.fc2 = nn.Linear(hidden_size, output_size).to(device)
-
-        # Initialize the dropout layer
+        self.fc1 = None  # will be dynamically defined based on input size
+        self.fc2 = nn.Linear(hidden_size, output_size)
         self.dropout_layer = nn.Dropout(dropout)
 
-        logger.info(
-            f"SNNLayer initialized with input_size={input_size}, hidden_size={hidden_size}, "
-            f"output_size={output_size}, timesteps={timesteps}, num_nodes={num_nodes}, dropout={dropout}"
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.fc1 is None:
+            input_size = x.size(-1)
+            self.fc1 = nn.Linear(input_size, self.hidden_size).to(x.device)
+
+        # Ensure the input tensor is of the same type as the model's parameters
+        x = x.to(dtype=self.fc2.weight.dtype, device=x.device)
+
+        if (
+            x.dim() == 2
+        ):  # If input is 2D (batch_size, feature_size), add a sequence dimension
+            x = x.unsqueeze(1)  # Reshape to (batch_size, 1, feature_size)
+
+        batch_size, seq_len, _ = x.shape
+
+        mem1 = torch.zeros(
+            batch_size, seq_len, self.hidden_size, device=x.device, dtype=x.dtype
+        )
+        mem2 = torch.zeros(
+            batch_size, seq_len, self.output_size, device=x.device, dtype=x.dtype
         )
 
-    def forward(
-        self,
-        input_ids: torch.Tensor,
-        attention_mask: torch.Tensor,
-        adj_matrix: torch.sparse_coo_tensor,
-        node_indices: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        """
-        Perform forward pass of the SNNLayer.
+        spikes = []
+        for _ in range(self.timesteps):
+            mem1 += self.fc1(x)
+            spike1 = (mem1 > 0.5).float()
+            mem1 *= mem1 <= 0.5
 
-        Args:
-            input_ids (torch.Tensor): Input tensor of shape (batch_size, seq_len, input_size) or (batch_size, input_size).
-            attention_mask (torch.Tensor): Attention mask tensor of shape (batch_size, seq_len, input_size) or (batch_size, input_size).
-            adj_matrix (torch.sparse_coo_tensor): Adjacency matrix in sparse COO format.
-            node_indices (Optional[torch.Tensor]): Tensor of node indices. Default is None.
+            spike1 = self.dropout_layer(spike1)
+            mem2 += self.fc2(spike1)
+            spike2 = (mem2 > 0.5).float()
+            mem2 *= mem2 <= 0.5
 
-        Returns:
-            torch.Tensor: Output tensor of shape (batch_size, output_size).
-        """
+            spikes.append(spike2)
 
-        # Ensure the input tensor has the correct shape
-        if input_ids.size(-1) < self.input_size:
-            # Pad input_ids with zeros to match the expected input_size
-            padding_size = self.input_size - input_ids.size(-1)
-            input_ids = torch.cat(
-                [
-                    input_ids,
-                    torch.zeros(input_ids.size(0), padding_size, device=self.device),
-                ],
-                dim=-1,
-            )
-        input_ids = input_ids.view(-1, self.input_size)
-
-        if input_ids.ndim == 1:
-            input_ids = input_ids.unsqueeze(0)
-            attention_mask = attention_mask.unsqueeze(0)
-
-        # Ensure input_ids has three dimensions [batch_size, seq_len, input_size]
-        if len(input_ids.size()) == 2:
-            input_ids = input_ids.unsqueeze(1)
-            attention_mask = attention_mask.unsqueeze(1)
-
-        batch_size, seq_len, input_size = input_ids.size()
-
-        if seq_len == 1:
-            input_ids = input_ids.squeeze(1)
-            attention_mask = attention_mask.squeeze(1)
-
-        assert seq_len == 1, "Input tensor should have a sequence length of 1"
-
-        # Check if input_ids and attention_mask are empty tensors
-        if input_ids.numel() == 0 and attention_mask.numel() == 0:
-            logger.warning("Received empty input tensors. Returning zeros output.")
-            return torch.zeros(batch_size, self.output_size, device=self.device)
-
-        # Move the input tensors to the specified device
-        input_ids = input_ids.to(self.device)
-        attention_mask = attention_mask.to(self.device)
-
-        # Ensure the input tensors are in float format
-        input_ids = input_ids.float()
-        attention_mask = attention_mask.float()
-
-        logger.debug(f"Input tensor shape: {input_ids.shape}")
-        logger.debug(f"Attention mask shape: {attention_mask.shape}")
-        logger.debug(f"Adjacency matrix shape: {adj_matrix.shape}")
-        if node_indices is not None:
-            logger.debug(f"Node indices shape: {node_indices.shape}")
-
-        # Ensure the input tensor has the correct shape
-        if input_ids.size(-1) != self.input_size:
-            input_ids = input_ids.view(-1, self.input_size)
-
-        # Apply the fully connected layers with dropout
-        hidden_output = self.dropout_layer(torch.relu(self.fc1(input_ids)))
-        output = self.fc2(hidden_output)
-        logger.debug(f"SNN output shape: {output.shape}")
+        output = torch.stack(spikes, dim=1).mean(dim=1)
 
         return output
 
 
-class LongformerLayer(nn.Module):
-    """
-    Longformer layer implementation for handling long sequences.
-
-    Args:
-        hidden_size (int): The hidden size of the Longformer model.
-        num_layers (int): The number of Longformer layers.
-        num_heads (int): The number of attention heads.
-        max_length (int): The maximum sequence length.
-        dropout (float): The dropout probability. Default is 0.1.
-    """
-
-    def __init__(
-        self,
-        hidden_size: int,
-        num_layers: int,
-        num_heads: int,
-        max_length: int,
-        dropout: float = 0.1,
-    ):
-        super(LongformerLayer, self).__init__()
-        self.hidden_size = hidden_size
-        self.num_layers = num_layers
-        self.num_heads = num_heads
-        self.max_length = max_length
-        self.dropout = dropout
-
-        # Initialize the Longformer model
-        self.longformer = LongformerModel(
-            config=LongformerConfig(
-                hidden_size=hidden_size,
-                num_hidden_layers=num_layers,
-                num_attention_heads=num_heads,
-                max_position_embeddings=max_length,
-                hidden_dropout_prob=dropout,
-                attention_probs_dropout_prob=dropout,
-            )
-        )
-
-    def forward(
-        self, input_ids: torch.Tensor, attention_mask: torch.Tensor
-    ) -> torch.Tensor:
-        """
-        Perform forward pass of the LongformerLayer.
-
-        Args:
-            input_ids (torch.Tensor): Input token IDs of shape (batch_size, seq_len).
-            attention_mask (torch.Tensor): Attention mask of shape (batch_size, seq_len).
-
-        Returns:
-            torch.Tensor: Output tensor of shape (batch_size, seq_len, hidden_size).
-        """
-        # Ensure input_ids and attention_mask have the correct shape
-        assert (
-            input_ids.shape == attention_mask.shape
-        ), "Input IDs and attention mask must have the same shape"
-
-        # Forward pass through the Longformer model
-        outputs = self.longformer(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-        )
-
-        # Extract the last hidden state
-        last_hidden_state = outputs.last_hidden_state
-
-        return last_hidden_state
-
-
 class SNNModel(nn.Module):
     """
-    Spiking Neural Network model integrating Longformer, SNNLayer, and Graph Attention layers.
-
+    Spiking Neural Network (SNN) model.
     Args:
         sp_params (dict): Parameters for the spatial pooling layer.
-        longformer_params (dict): Parameters for the Longformer layer.
-        snn_params (dict): Parameters for the SNNLayer.
         gat_params (dict): Parameters for the Graph Attention layer.
-        htm_params (dict): Parameters for the HTM layer.
+        htm_params (dict): Parameters for the Hierarchical Temporal Memory layer.
         device (torch.device): The device to run the model on.
         vocab (dict): The vocabulary mapping for token to index.
-        tokenizer (LongformerTokenizer): The Longformer tokenizer.
-        max_sequence_length (int): The maximum sequence length.
-
-    Attributes:
-        sp_params (dict): Spatial pooling parameters.
-        longformer_params (dict): Longformer layer parameters.
-        snn_params (dict): SNNLayer parameters.
-        gat_params (dict): Graph Attention layer parameters.
-        htm_params (dict): HTM layer parameters.
-        device (torch.device): Computation device.
-        vocab (dict): Vocabulary mapping.
-        tokenizer (LongformerTokenizer): Longformer tokenizer.
-        max_sequence_length (int): Maximum sequence length.
-        output_size (int): Output size derived from `sp_params`.
-        longformer_layer (LongformerLayer): The Longformer layer of the model.
-        snn_layer (SNNLayer): The SNNLayer of the model.
-        gat_layer (GraphAttentionLayer): The GAT layer of the model.
-        htm_layer (HTMModel): The HTM layer of the model.
-        fc_out (nn.Linear): Final fully connected layer.
+        tokenizer (PreTrainedTokenizer): The tokenizer for processing text.
+        snn_params (dict): Parameters for the SNN layer.
     """
 
     def __init__(
         self,
         sp_params: dict,
-        longformer_params: dict,
-        snn_params: dict,
         gat_params: dict,
         htm_params: dict,
         device: torch.device,
         vocab: dict,
-        tokenizer: LongformerTokenizer,
-        max_sequence_length: int,
+        tokenizer: PreTrainedTokenizer,
+        snn_params: dict,
     ):
         super(SNNModel, self).__init__()
         self.sp_params = sp_params
-        self.longformer_params = longformer_params
-        self.snn_params = snn_params
         self.gat_params = gat_params
         self.htm_params = htm_params
         self.device = device
         self.vocab = vocab
         self.tokenizer = tokenizer
-        self.max_sequence_length = max_sequence_length
-
         self.output_size = sp_params["sdr_dimensions"]
-        self.longformer_layer = LongformerLayer(
-            hidden_size=longformer_params["hidden_size"],
-            num_layers=longformer_params["num_layers"],
-            num_heads=longformer_params["num_heads"],
-            max_length=max_sequence_length,
-            dropout=longformer_params.get("dropout", 0.1),
-        ).to(device)
+
         self.snn_layer = SNNLayer(
-            input_size=longformer_params["hidden_size"],
             hidden_size=snn_params["hidden_size"],
             output_size=snn_params["output_size"],
             timesteps=snn_params["timesteps"],
             num_nodes=self.output_size,
             dropout=snn_params.get("dropout", 0.0),
-            device=device,
         ).to(device)
+
         self.gat_layer = GraphAttentionLayer(
             in_features=gat_params["in_features"],
             out_features=gat_params["out_features"],
             num_heads=gat_params["num_heads"],
-            dropout=gat_params.get("dropout", 0.0),
             alpha=gat_params["alpha"],
-            concat=gat_params["concat"],
         ).to(device)
+
+        # Ensure the output size of SNNLayer matches the expected input size of HTMModel
         self.htm_layer = HTMModel(
             sdr_dimensions=self.output_size, device=device, **htm_params
         ).to(device)
+
         self.fc_out = nn.Linear(self.output_size, self.output_size).to(device)
 
         logger.info(
-            f"SNNModel initialized with sp_params={sp_params}, longformer_params={longformer_params},"
-            f"snn_params={snn_params}, gat_params={gat_params}, htm_params={htm_params}, output_size={self.output_size}"
+            f"SNNModel initialized with sp_params={sp_params}, gat_params={gat_params},"
+            f"htm_params={htm_params}, output_size={self.output_size}"
         )
 
     def forward(
@@ -409,56 +264,213 @@ class SNNModel(nn.Module):
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
         adj_matrix: torch.sparse_coo_tensor,
-        node_indices: Optional[torch.Tensor] = None,
+        node_indices: torch.Tensor,
     ) -> torch.Tensor:
         """
-        Perform forward pass of the SNNModel.
-
+        Perform the forward pass of the SNN model.
         Args:
-            input_ids (torch.Tensor): Input token IDs of shape (batch_size, seq_len).
-            attention_mask (torch.Tensor): Attention mask of shape (batch_size, seq_len).
-            adj_matrix (torch.sparse_coo_tensor): Adjacency matrix in sparse COO format.
-            node_indices (Optional[torch.Tensor]): Tensor of node indices. Default is None.
-
+            input_ids (torch.Tensor): The input token IDs tensor of shape (batch_size, seq_len) or (batch_size,).
+            attention_mask (torch.Tensor): The attention mask tensor of shape (batch_size, seq_len) or (batch_size,).
+            adj_matrix (torch.sparse_coo_tensor): The adjacency matrix in sparse COO format.
+            node_indices (torch.Tensor): The node indices tensor.
         Returns:
-            torch.Tensor: Output tensor of shape (batch_size, output_size).
+            torch.Tensor: The output tensor of shape (batch_size, output_size).
         """
-        # Forward pass through the Longformer layer
-        longformer_output = self.longformer_layer(input_ids, attention_mask)
-        logger.debug(f"Longformer output shape: {longformer_output.shape}")
+        logger.debug(f"Input tensor shape: {input_ids.shape}")
+        logger.debug(f"Attention mask shape: {attention_mask.shape}")
+        logger.debug(f"Adjacency matrix shape: {adj_matrix.shape}")
+        logger.debug(f"Node indices shape: {node_indices.shape}")
 
-        # Implement chunking mechanism
-        chunk_size = 512  # Adjust the chunk size based on available memory
-        output_chunks = []
+        # Add an extra dimension if input_ids is 1D
+        if input_ids.ndim == 1:
+            input_ids = input_ids.unsqueeze(0)
+            attention_mask = attention_mask.unsqueeze(0)
 
-        for i in range(0, longformer_output.size(1), chunk_size):
-            chunk_longformer_output = longformer_output[:, i : i + chunk_size, :]
+        batch_size, seq_len = input_ids.size()
 
-            # Forward pass through the SNNLayer
-            chunk_snn_output = self.snn_layer(
-                chunk_longformer_output, None, adj_matrix, node_indices
-            )
-            logger.debug(f"SNNLayer output shape: {chunk_snn_output.shape}")
+        # Move the input tensors to the specified device
+        input_ids = input_ids.to(self.device)
+        attention_mask = attention_mask.to(self.device)
 
-            # Reshape the SNNLayer output tensor
-            chunk_snn_output = chunk_snn_output.view(chunk_snn_output.size(0), 1, -1)
-            logger.debug(f"Reshaped SNNLayer output shape: {chunk_snn_output.shape}")
+        # Apply the SNN layer
+        snn_output = self.snn_layer(input_ids)
+        logger.debug(f"SNN output shape: {snn_output.shape}")
 
-            output_chunks.append(chunk_snn_output)
-
-        snn_output = torch.cat(output_chunks, dim=1)
-        logger.debug(f"Concatenated SNNLayer output shape: {snn_output.shape}")
-
-        # Forward pass through the GAT layer
-        gat_output = self.gat_layer(snn_output)
+        # Apply the GAT layer
+        gat_output = self.gat_layer(snn_output, adj_matrix)
         logger.debug(f"GAT output shape: {gat_output.shape}")
 
-        # Forward pass through the HTM layer
-        htm_output = self.htm_layer(gat_output).view(gat_output.size(0), -1)
+        # Apply the HTM layer
+        htm_output = self.htm_layer(gat_output).view(batch_size, -1)
         logger.debug(f"HTM output shape: {htm_output.shape}")
 
-        # Final fully connected layer
+        # Apply the final fully connected layer
         output = self.fc_out(htm_output)
         logger.debug(f"Final output shape: {output.shape}")
 
         return output
+
+    def generate(
+            self,
+            input_conversation: list,
+            adjacency_matrix: torch.Tensor,
+            node_indices: torch.Tensor,
+            max_length: int = 100,
+            num_return_sequences: int = 1,
+            temperature: float = 0.7,
+            top_k: int = 50,
+            top_p: float = 0.9,
+            mirostat_eta: float = 0.1,
+            mirostat_tau: float = 5.0,
+            **kwargs,
+    ) -> list:
+        """
+        Generate responses based on the input conversation.
+
+        Args:
+            input_conversation (list): The input conversation as a list of strings or tensors.
+            adjacency_matrix (torch.Tensor): The adjacency matrix tensor.
+            node_indices (torch.Tensor): The node indices tensor.
+            max_length (int): The maximum length of the generated response.
+            num_return_sequences (int): The number of responses to generate.
+            temperature (float): The temperature for sampling.
+            top_k (int): The number of top-k tokens to consider for filtering.
+            top_p (float): The cumulative probability threshold for filtering.
+            mirostat_eta (float): The learning rate for Mirostat.
+            mirostat_tau (float): The target entropy for Mirostat.
+
+        Returns:
+            list: The generated conversations as a list of strings.
+        """
+        generated_conversations = []
+
+        # Convert the input conversation to a list of strings
+        string_conversation = [
+            str(turn.item()) if isinstance(turn, torch.Tensor) else str(turn)
+            for turn in input_conversation
+        ]
+
+        # Check if the input conversation is empty
+        if not string_conversation:
+            logger.warning("Input conversation is empty. Skipping generation.")
+            return generated_conversations
+
+        for _ in range(num_return_sequences):
+            generated_conversation = []
+
+            # Concatenate the input conversation to start the generation
+            input_text = " ".join(string_conversation)
+            generated_conversation.append(input_text)
+
+            # Initialize Mirostat parameters
+            mirostat_mu = 2.0 * mirostat_tau
+            mirostat_s = 1.0
+
+            # Generate the model's response
+            model_input = self._prepare_input(generated_conversation)
+            input_ids = model_input["input_ids"].to(self.device)
+            attention_mask = model_input["attention_mask"].to(self.device)
+
+            response = []
+            while len(response) < max_length:
+                # Forward pass
+                if adjacency_matrix is None or node_indices is None:
+                    # If adjacency_matrix or node_indices are not provided, create dummy values
+                    dummy_adj_matrix = torch.eye(input_ids.size(-1), dtype=torch.bool).to(self.device)
+                    dummy_node_indices = torch.arange(input_ids.size(-1), device=self.device)
+                    output = self.forward(input_ids, attention_mask, dummy_adj_matrix, dummy_node_indices)
+                else:
+                    output = self.forward(input_ids, attention_mask, adjacency_matrix, node_indices)
+
+                # Sample from the model's output distribution
+                output_logits = output[:, -1, :] / temperature
+                filtered_logits = self._top_k_top_p_filtering(
+                    output_logits, top_k=top_k, top_p=top_p
+                )
+                probabilities = torch.softmax(filtered_logits, dim=-1)
+                next_token = torch.multinomial(probabilities, num_samples=1)
+
+                # Update Mirostat parameters
+                mirostat_s = (
+                        mirostat_eta * (output_logits.max().item() - mirostat_tau)
+                        + (1 - mirostat_eta) * mirostat_s
+                )
+                mirostat_mu = mirostat_mu * torch.exp(mirostat_s)
+                temperature = max(0.1, temperature * (mirostat_tau / mirostat_mu))
+
+                # Check if the generated token is the end-of-sequence token
+                if next_token.item() == self.eos_token_id:
+                    break
+
+                response.append(next_token.item())
+                input_ids = torch.cat([input_ids, next_token], dim=-1)
+                attention_mask = torch.cat(
+                    [attention_mask, torch.tensor([1], device=self.device, dtype=torch.long)], dim=-1
+                )
+
+            # Add the generated response to the conversation
+            generated_response = self.tokenizer.decode(response)
+            generated_conversation.append(generated_response)
+            generated_conversations.append(generated_conversation)
+
+        return generated_conversations
+
+    def _prepare_input(self, conversation: list) -> dict:
+        """
+        Prepare the input for the model based on the conversation structure.
+
+        Args:
+            conversation (list): The conversation as a list of strings.
+
+        Returns:
+            dict: The prepared input for the model.
+        """
+        input_ids = []
+
+        for turn in conversation:
+            if isinstance(turn, str):
+                encoded_turn = self.tokenizer.encode(turn, add_special_tokens=False)
+                if encoded_turn:
+                    input_ids.extend(encoded_turn + [self.tokenizer.eos_token_id])
+
+        # Remove None values from input_ids
+        input_ids = [token for token in input_ids if token is not None]
+
+        if input_ids:
+            input_ids = torch.tensor(input_ids, dtype=torch.long).unsqueeze(0)
+            attention_mask = torch.ones_like(input_ids, dtype=torch.long)
+            return {"input_ids": input_ids, "attention_mask": attention_mask}
+        else:
+            logger.warning(
+                "No valid turns found in the conversation. Returning empty input."
+            )
+            empty_tensor = torch.tensor([], dtype=torch.long).unsqueeze(0)
+            return {"input_ids": empty_tensor, "attention_mask": empty_tensor}
+
+    @staticmethod
+    def _top_k_top_p_filtering(logits, top_k=0, top_p=1.0, filter_value=-float("Inf")):
+        # Filter the logits using top-k and/or top-p filtering
+        top_k = min(top_k, logits.size(-1))
+        if top_k > 0:
+            indices_to_remove = logits < torch.topk(logits, top_k)[0][..., -1, None]
+            logits[indices_to_remove] = filter_value
+
+        if top_p < 1.0:
+            sorted_logits, sorted_indices = torch.sort(logits, descending=True)
+            cumulative_probs = torch.cumsum(
+                torch.softmax(sorted_logits, dim=-1), dim=-1
+            )
+
+            # Remove tokens with cumulative probability above the threshold
+            sorted_indices_to_remove = cumulative_probs > top_p
+            # Shift the indices to the right to keep also the first token above the threshold
+            sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[
+                ..., :-1
+            ].clone()
+            sorted_indices_to_remove[..., 0] = 0
+
+            # Convert from sorted indices to original indices
+            indices_to_remove = sorted_indices[sorted_indices_to_remove]
+            logits[indices_to_remove] = filter_value
+
+        return logits

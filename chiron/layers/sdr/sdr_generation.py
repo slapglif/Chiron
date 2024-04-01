@@ -1,136 +1,89 @@
-# sdr_generation.py
-import concurrent.futures
-from typing import List
-
 import numpy as np
+from sklearn.decomposition import TruncatedSVD
 from loguru import logger
-from sklearn.decomposition import IncrementalPCA
-from torch.utils.tensorboard import SummaryWriter
+from typing import List, Optional, Union
 
 
 class SDRGenerator:
     """
-    Class for generating Sparse Distributed Representations (SDRs) from embeddings.
+    Generates Sparse Distributed Representations (SDRs) from high-dimensional data vectors.
+    Utilizes dimensionality reduction and binary thresholding to produce SDRs.
+
+    Attributes:
+        projection_dimensions (int): Target dimensionality after dimensionality reduction.
+        sdr_dimensions (int): Final dimensionality of the SDRs.
+        sparsity (float): Fraction of bits that are active in the SDR.
     """
 
     def __init__(
         self,
-        pca_components: int,
+        projection_dimensions: int,
         sdr_dimensions: int,
         sparsity: float,
-        batch_size: int = 1000,
-        log_dir: str = "logs",
-        num_workers: int = 4,
-    ):
+        use_gpu: bool = True,
+    ) -> None:
         """
-        Initialize the SDRGenerator.
+        Initializes the SDRGenerator with the given parameters.
 
         Args:
-            pca_components (int): Number of PCA components to retain.
-            sdr_dimensions (int): Dimensions of the SDR vectors.
-            sparsity (float): Sparsity level of the SDR vectors.
-            batch_size (int): Batch size for processing embeddings.
-            log_dir (str): Directory to store log files.
-            num_workers (int): Number of worker processes for parallel processing.
+            projection_dimensions (int): The number of dimensions to reduce the input embeddings to, should be less than sdr_dimensions.
+            sdr_dimensions (int): The number of dimensions in the resulting SDR.
+            sparsity (float): The proportion of active bits in the SDR, typically a small value (e.g., 0.05 for 5% sparsity).
         """
-        self.pca_components = pca_components
+        self.projection_dimensions = projection_dimensions
         self.sdr_dimensions = sdr_dimensions
         self.sparsity = sparsity
-        self.batch_size = batch_size
-        self.pca = IncrementalPCA(n_components=pca_components, batch_size=batch_size)
-        self.projection_matrix = None
-        self.writer = SummaryWriter(log_dir=log_dir)
-        self.num_workers = num_workers
 
-    def generate_sdr_embeddings(self, embeddings: List[List[np.ndarray]]) -> np.ndarray:
+        # Ensure that the projection dimension is less than the SDR dimensions
+        if self.projection_dimensions >= self.sdr_dimensions:
+            logger.error("Projection dimensions should be less than SDR dimensions.")
+            raise ValueError(
+                "Projection dimensions should be less than SDR dimensions."
+            )
+
+        self.projection = TruncatedSVD(n_components=self.projection_dimensions)
+
+    def generate_sdr_embeddings(
+        self, embeddings: List[np.ndarray]
+    ) -> Optional[np.ndarray]:
         """
-        Generate SDR embeddings from the given embeddings.
+        Generates SDR embeddings from the provided high-dimensional data vectors.
 
         Args:
-            embeddings (List[List[np.ndarray]]): List of embeddings.
+            embeddings (List[np.ndarray]): A list of high-dimensional data vectors to be converted to SDRs.
 
         Returns:
-            np.ndarray: Generated SDR embeddings.
+            Optional[np.ndarray]: An array of SDRs or None if the process fails.
         """
+        if not embeddings:
+            logger.warning("No embeddings provided for SDR generation.")
+            return None
+
+        # Filter out empty or invalid embeddings and validate data
         valid_embeddings = [
             emb
-            for batch_embeddings in embeddings
-            for emb in batch_embeddings
-            if len(emb) > 0
+            for emb in embeddings
+            if emb.size > 0 and not np.isnan(emb).any() and not np.isinf(emb).any()
         ]
 
-        if not valid_embeddings:
-            raise ValueError("No valid embeddings found.")
+        if len(valid_embeddings) == 0:
+            logger.warning("No valid embeddings found after filtering.")
+            return None
 
-        total_valid_embeddings = len(valid_embeddings)
+        # Concatenate the list of arrays into a single 2D array for SVD
+        concatenated_embeddings = np.vstack(valid_embeddings)
 
-        n_components = min(self.pca_components, total_valid_embeddings)
-        self.pca.n_components = n_components
+        try:
+            # Dimensionality reduction using SVD
+            reduced_embeddings = self.projection.fit_transform(concatenated_embeddings)
 
-        with concurrent.futures.ThreadPoolExecutor(
-            max_workers=self.num_workers
-        ) as executor:
-            futures = [
-                executor.submit(self.pca.partial_fit, batch)
-                for batch in np.array_split(
-                    valid_embeddings, max(1, len(valid_embeddings) // self.batch_size)
-                )
-            ]
-            concurrent.futures.wait(futures)
-            pca_embeddings = list(
-                executor.map(
-                    self.pca.transform,
-                    np.array_split(
-                        valid_embeddings,
-                        max(1, len(valid_embeddings) // self.batch_size),
-                    ),
-                )
-            )
-            pca_embeddings = np.concatenate(pca_embeddings)
+            # Binarize the reduced embeddings to generate SDRs
+            threshold = np.percentile(reduced_embeddings, (1 - self.sparsity) * 100)
+            sdr_embeddings = (reduced_embeddings >= threshold).astype(int)
 
-        sdr_embeddings = self.binarize(pca_embeddings)
+            return sdr_embeddings
 
-        logger.debug("Initialized SDRGenerator with the following parameters:")
-        logger.debug(f"  PCA Components: {self.pca_components}")
-        logger.debug(f"  SDR Dimensions: {self.sdr_dimensions}")
-        logger.debug(f"  Sparsity: {self.sparsity}")
-        logger.debug(f"  Batch Size: {self.batch_size}")
-        logger.debug(f"  Log Directory: {self.writer.get_logdir()}")
-        logger.debug(f"  Number of Workers: {self.num_workers}")
-        logger.debug(f"Total number of valid embeddings: {total_valid_embeddings}")
-        logger.debug(f"Generated {len(sdr_embeddings)} SDR embeddings.")
+        except Exception as e:
+            logger.error(f"An unexpected error occurred during SDR generation: {e}")
 
-        sparsity = np.mean(sdr_embeddings)
-        logger.debug(f"SDR Sparsity: {sparsity:.4f}")
-
-        self.writer.add_scalar("Embeddings/Valid", total_valid_embeddings)
-        self.writer.add_scalar("Embeddings/SDR", len(sdr_embeddings))
-        self.writer.add_scalar("Embeddings/SDR_Sparsity", sparsity)
-        self.writer.add_histogram("Embeddings/SDR_Distribution", sdr_embeddings)
-
-        return sdr_embeddings
-
-    def binarize(self, embeddings: np.ndarray) -> np.ndarray:
-        """
-        Binarize the embeddings to create SDRs.
-
-        Args:
-            embeddings (np.ndarray): Input embeddings.
-
-        Returns:
-            np.ndarray: Binarized SDR embeddings.
-        """
-        if self.projection_matrix is None:
-            self.projection_matrix = np.random.randn(
-                embeddings.shape[1], self.sdr_dimensions
-            )
-        projected_embeddings = np.dot(embeddings, self.projection_matrix)
-        sorted_indices = np.argsort(projected_embeddings, axis=1)
-        num_active_bits = int(self.sparsity * self.sdr_dimensions)
-        sdr_embeddings = np.zeros((len(embeddings), self.sdr_dimensions), dtype=bool)
-
-        for i in range(len(embeddings)):
-            active_indices = sorted_indices[i, -num_active_bits:]
-            sdr_embeddings[i, active_indices] = True
-
-        return sdr_embeddings
+        return None

@@ -129,23 +129,9 @@ def evaluate_text_prediction(
     device: torch.device,
     max_length: int = 1024,
     num_return_sequences: int = 1,
+    adjacency_matrix_sparse: Any = None,
     **kwargs: Any,
 ) -> Dict[str, float]:
-    """
-    Evaluate the text prediction performance of a model.
-
-    Args:
-        model (SNNModel): The semantic folding model.
-        tokenizer (PreTrainedTokenizer): The tokenizer for the language model.
-        dataset (torch.utils.data.Dataset): The dataset to evaluate on.
-        device (torch.device): The device to run the evaluation on.
-        max_length (int): The maximum length of the generated text.
-        num_return_sequences (int): The number of sequences to generate.
-        **kwargs (Any): Additional keyword arguments for text generation.
-
-    Returns:
-        Dict[str, float]: The evaluation metrics.
-    """
     model.eval()
     metrics = {}
 
@@ -161,7 +147,9 @@ def evaluate_text_prediction(
             # Generate text
             output_ids = model.generate(
                 input_ids,
-                max_length=max_length,
+                node_indices=node_indices,
+                attention_mask=attention_mask,
+                adjacency_matrix=adjacency_matrix_sparse,
                 num_return_sequences=num_return_sequences,
                 **kwargs,
             )

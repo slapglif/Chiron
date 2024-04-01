@@ -1,20 +1,18 @@
 # main.py
+
 import argparse
-import concurrent
+import os
 import sys
 from collections import Counter
-from concurrent.futures import ThreadPoolExecutor
-from typing import Dict, List, Any, Union
+from typing import Dict, List, Any
 
 import numpy as np
 import torch
-import torch.nn as nn
 from datasets import load_dataset as data_load
 from loguru import logger
 from sklearn.model_selection import KFold
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
-from tqdm import tqdm
 from transformers import LongformerTokenizer
 
 from chiron.evaluation.downstream_tasks import (
@@ -24,7 +22,11 @@ from chiron.evaluation.downstream_tasks import (
 from chiron.evaluation.metrics import evaluate_text_prediction
 from chiron.evaluation.visualization import plot_evaluation_metrics
 from chiron.layers.sdr.sdr_generation import SDRGenerator
-from chiron.layers.snn.model import SNNModel, create_adjacency_matrix
+from chiron.layers.snn.model import (
+    SNNModel,
+    create_adjacency_matrix,
+    create_adjacency_matrix_batched,
+)
 from chiron.pipeline import TextPredictionPipeline
 from chiron.preprocessing.embedding import Word2VecEmbedding
 from chiron.preprocessing.text_preprocessing import TextPreprocessor
@@ -32,12 +34,26 @@ from chiron.train import train, evaluate
 from chiron.utils.config import Config
 from chiron.utils.data import SemanticFoldingDataset
 
+os.environ["JOBLIB_MULTIPROCESSING"] = "0"
+
 
 def build_vocab(
-    preprocessed_conversations: List[List[str]], max_vocab_size: int
+    preprocessed_conversations: List[str], max_vocab_size: int
 ) -> Dict[str, int]:
+    """
+    Build a vocabulary from the preprocessed conversations.
+
+    Args:
+        preprocessed_conversations (List[str]): List of preprocessed conversations.
+        max_vocab_size (int): Maximum size of the vocabulary.
+
+    Returns:
+        Dict[str, int]: Vocabulary dictionary mapping tokens to indices.
+    """
     vocab = {"<PAD>": 0, "<UNK>": 1}
-    token_counts: Counter = count_token_frequencies(preprocessed_conversations)
+    token_counts: Counter = TextPreprocessor.count_token_frequencies(
+        preprocessed_conversations
+    )
 
     for idx, (token, count) in enumerate(
         token_counts.most_common(max_vocab_size - 2), start=2
@@ -65,55 +81,51 @@ def main(config_path: str) -> None:
     preprocessor = TextPreprocessor(**config["preprocessing_params"])
 
     conversations = load_dataset(config)
-    # main.py
     preprocessed_conversations = preprocessor.preprocess(
         conversations, cache_key="preprocessed_conversations"
     )
-    preprocessed_conversations_flattened = [
-        token for conv in preprocessed_conversations for token in conv
-    ]
 
     logger.info(
         f"Number of preprocessed conversations: {len(preprocessed_conversations)}"
     )
     logger.debug(f"First preprocessed conversation: {preprocessed_conversations[0]}")
 
+    # Flatten the preprocessed conversations
+    preprocessed_conversations = [
+        token for conv in preprocessed_conversations for token in conv
+    ]
+
+    logger.info(f"Number of preprocessed tokens: {len(preprocessed_conversations)}")
+    logger.debug(f"First preprocessed token: {preprocessed_conversations[0]}")
+
     # Generate word embeddings
     logger.info("Generating word embeddings...")
     embedding_model = Word2VecEmbedding(**config["embedding_params"])
     embeddings = embedding_model.generate_embeddings(
-        preprocessed_conversations_flattened, cache_key="embeddings"
+        preprocessed_conversations, cache_key="embeddings"
     )
     logger.info(f"Number of embeddings: {len(embeddings)}")
 
     # Generate SDRs
     logger.info("Generating SDRs...")
     sdr_generator = SDRGenerator(**config["sdr_params"])
-    sdr_embeddings = sdr_generator.generate_sdr_embeddings(embeddings)
+    sdr_embeddings: np.ndarray = sdr_generator.generate_sdr_embeddings(embeddings)
     logger.info(f"SDR embeddings shape: {sdr_embeddings.shape}")
 
     # Create an adjacency matrix
     logger.info("Creating adjacency matrix...")
     device = torch.device(config["device"])
-    sdr_embeddings_float = sdr_embeddings.astype(float)
+    sdr_embeddings_tensor = torch.from_numpy(sdr_embeddings).float().to(device)
 
-    adjacency_matrix_sparse = create_adjacency_matrix(
-        sdr_embeddings_float,
+    adjacency_matrix_sparse = create_adjacency_matrix_batched(
+        sdr_embeddings_tensor,
         threshold=config["adjacency_matrix"]["threshold"],
-        subsample_rate=config["adjacency_matrix"]["subsample_rate"],
-        n_jobs=config["adjacency_matrix"].get("n_jobs", -1),
-        chunk_size=config["adjacency_matrix"].get("chunk_size", 5000),
-        device=device,
     )
 
     # Load the tokenizer
     tokenizer = LongformerTokenizer.from_pretrained("allenai/longformer-base-4096")
 
     # Create a vocabulary dictionary from the preprocessed conversations
-    preprocessed_conversations = [
-        [token] for conv in preprocessed_conversations for token in conv
-    ]
-
     vocab = build_vocab(
         preprocessed_conversations, max_vocab_size=preprocessor.max_vocab_size
     )
@@ -158,21 +170,15 @@ def main(config_path: str) -> None:
         )
 
         logger.info(f"Creating SNN model for fold {fold + 1}...")
-        snn_model: Union[SNNModel, nn.DataParallel] = SNNModel(
+        snn_model = SNNModel(
             sp_params=config["sdr_params"],
-            longformer_params=config["longformer_params"],
             gat_params=config["gat_params"],
             htm_params=config["htm_params"],
             device=device,
             vocab=vocab,
             tokenizer=tokenizer,
-            max_sequence_length=config["max_sequence_length"],
             snn_params=config["snn_params"],
         ).to(device)
-
-        # Wrap the model with DataParallel for multi-GPU training
-        if torch.cuda.device_count() > 1:
-            snn_model = nn.DataParallel(snn_model)
 
         # Train model
         train_config = {
@@ -224,56 +230,56 @@ def main(config_path: str) -> None:
             f"Text prediction metrics for fold {fold + 1}: {text_prediction_metrics}"
         )
 
-        # Compute average metrics across folds
-        avg_metrics = {
-            metric: np.mean(
-                [fold.get(metric, default_metrics[metric]) for fold in fold_metrics]
-            )
-            for metric in default_metrics.keys()
-        }
-
-        logger.info("Average metrics across folds:")
-        for metric, value in avg_metrics.items():
-            logger.info(f"{metric}: {value:.4f}")
-
-        # Create the text prediction pipeline
-        pipeline = TextPredictionPipeline(
-            snn_model,
-            tokenizer,
-            device,
-            max_length=config["text_prediction"]["max_length"],
-            num_return_sequences=config["text_prediction"]["num_return_sequences"],
+    # Compute average metrics across folds
+    avg_metrics = {
+        metric: np.mean(
+            [fold.get(metric, default_metrics[metric]) for fold in fold_metrics]
         )
+        for metric in default_metrics.keys()
+    }
 
-        # Perform text prediction
-        input_text = "what is the meaning of life? let me know your thoughts"
-        predicted_texts = pipeline(input_text)
-        logger.info(f"Predicted texts: {predicted_texts}")
+    logger.info("Average metrics across folds:")
+    for metric, value in avg_metrics.items():
+        logger.info(f"{metric}: {value:.4f}")
 
-        if config["labels"]:
-            semantic_sim_accuracy, semantic_sim_f1 = semantic_similarity_prediction(
-                sdr_embeddings, config["labels"]
-            )
-            text_class_accuracy, text_class_f1 = text_classification(
-                sdr_embeddings, config["labels"]
-            )
-        else:
-            semantic_sim_accuracy, semantic_sim_f1 = 0.0, 0.0
-            text_class_accuracy, text_class_f1 = 0.0, 0.0
+    # Create the text prediction pipeline
+    pipeline = TextPredictionPipeline(
+        snn_model,
+        tokenizer,
+        device,
+        max_length=config["text_prediction"]["max_length"],
+        num_return_sequences=config["text_prediction"]["num_return_sequences"],
+    )
 
-        logger.info("Plotting evaluation metrics...")
-        plot_evaluation_metrics(
-            avg_metrics,
-            semantic_sim_accuracy,
-            semantic_sim_f1,
-            text_class_accuracy,
-            text_class_f1,
+    # Perform text prediction
+    input_text = "what is the meaning of life? let me know your thoughts"
+    predicted_texts = pipeline(input_text)
+    logger.info(f"Predicted texts: {predicted_texts}")
+
+    if config["labels"]:
+        semantic_sim_accuracy, semantic_sim_f1 = semantic_similarity_prediction(
+            sdr_embeddings, config["labels"]
         )
+        text_class_accuracy, text_class_f1 = text_classification(
+            sdr_embeddings, config["labels"]
+        )
+    else:
+        semantic_sim_accuracy, semantic_sim_f1 = 0.0, 0.0
+        text_class_accuracy, text_class_f1 = 0.0, 0.0
 
-        logger.info("Training completed.")
+    logger.info("Plotting evaluation metrics...")
+    plot_evaluation_metrics(
+        avg_metrics,
+        semantic_sim_accuracy,
+        semantic_sim_f1,
+        text_class_accuracy,
+        text_class_f1,
+    )
 
-        # Close TensorBoard writer
-        writer.close()
+    logger.info("Training completed.")
+
+    # Close TensorBoard writer
+    writer.close()
 
 
 def load_dataset(config: Config) -> List[List[Dict[str, Any]]]:
@@ -296,33 +302,6 @@ def load_dataset(config: Config) -> List[List[Dict[str, Any]]]:
     conversations = dataset["conversations"]
 
     return conversations
-
-
-def count_token_frequencies(tokenized_texts: List[List[str]]) -> Counter:
-    """
-    Count token frequencies in the tokenized texts using ThreadPoolExecutor.
-
-    Args:
-        tokenized_texts (List[List[str]]): List of tokenized texts.
-
-    Returns:
-        Counter: Token frequency counts.
-    """
-    with ThreadPoolExecutor() as executor:
-        futures = [
-            executor.submit(lambda: Counter(text))
-            for text in tqdm(tokenized_texts, desc="submitting tasks...")
-        ]
-
-        token_counts = Counter()
-        for future in tqdm(
-            concurrent.futures.as_completed(futures),
-            total=len(futures),
-            desc="Counting token frequencies",
-        ):
-            token_counts.update(future.result())
-
-    return token_counts
 
 
 if __name__ == "__main__":

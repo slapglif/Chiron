@@ -1,4 +1,6 @@
-# train.py
+import os
+import datetime
+import safetensors
 import torch
 import torch.nn as nn
 from loguru import logger
@@ -6,9 +8,64 @@ from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 from transformers import PreTrainedTokenizer
+from chiron.layers.snn.model import SNNModel
 
 from chiron.evaluation.metrics import evaluate_text_prediction
-from chiron.layers.snn.model import SNNModel
+
+
+def save_checkpoint(epoch, model, optimizer, scheduler, checkpoint_dir, model_name):
+    """
+    Save the model state, optimizer state, and scheduler state as a checkpoint.
+
+    Args:
+        epoch (int): The current epoch number.
+        model (SNNModel): The model instance.
+        optimizer (torch.optim.Optimizer): The optimizer instance.
+        scheduler (torch.optim.lr_scheduler._LRScheduler): The learning rate scheduler instance.
+        checkpoint_dir (str): The directory to save the checkpoint.
+        model_name (str): The name of the model.
+    """
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    checkpoint_path = os.path.join(checkpoint_dir, f"{model_name}_epoch_{epoch}.pth")
+    checkpoint = {
+        "epoch": epoch,
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "scheduler_state_dict": scheduler.state_dict(),
+    }
+    torch.save(checkpoint, checkpoint_path)
+    logger.info(f"Checkpoint saved: {checkpoint_path}")
+
+    # Update the latest checkpoint symlink
+    latest_checkpoint_dir = os.path.join(checkpoint_dir, "latest")
+    os.makedirs(latest_checkpoint_dir, exist_ok=True)
+    latest_checkpoint_path = os.path.join(
+        latest_checkpoint_dir,
+        f"{model_name}_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.pth",
+    )
+    os.symlink(os.path.abspath(checkpoint_path), latest_checkpoint_path)
+    logger.info(f"Latest checkpoint symlink updated: {latest_checkpoint_path}")
+
+
+def load_checkpoint(checkpoint_path, model, optimizer, scheduler):
+    """
+    Load a checkpoint and update the model, optimizer, and scheduler states.
+
+    Args:
+        checkpoint_path (str): The path to the checkpoint file.
+        model (SNNModel): The model instance.
+        optimizer (torch.optim.Optimizer): The optimizer instance.
+        scheduler (torch.optim.lr_scheduler._LRScheduler): The learning rate scheduler instance.
+
+    Returns:
+        int: The epoch to start training from.
+    """
+    checkpoint = torch.load(checkpoint_path)
+    model.load_state_dict(checkpoint["model_state_dict"])
+    optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+    scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+    start_epoch = checkpoint["epoch"] + 1
+    return start_epoch
 
 
 def train(
@@ -20,6 +77,9 @@ def train(
     device: torch.device,
     adjacency_matrix_sparse: torch.sparse_coo_tensor,
     writer: SummaryWriter,
+    checkpoint_dir: str = ".checkpoints",
+    resume_from_latest: bool = True,
+    model_name: str = "snn_model",
 ) -> None:
     """
     Train the SNNModel on the given datasets.
@@ -33,17 +93,38 @@ def train(
         device (torch.device): The device to run the training on.
         adjacency_matrix_sparse (torch.sparse_coo_tensor): The adjacency matrix in sparse COO format.
         writer (SummaryWriter): The TensorBoard writer for logging.
+        checkpoint_dir (str): The directory to save checkpoints.
+        resume_from_latest (bool): Whether to resume training from the latest checkpoint.
+        model_name (str): The name of the model.
     """
     optimizer = torch.optim.Adam(model.parameters(), lr=config["learning_rate"])
     criterion = nn.NLLLoss()
-    num_classes = (
-        model.output_size
-    )  # Assuming output_size represents the number of classes
+    num_classes = model.output_size
     node_to_class_mapping = {i: i % num_classes for i in range(num_classes)}
 
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode="min", patience=config["patience"], factor=0.1, verbose=True
     )
+
+    start_epoch = 1
+    if resume_from_latest:
+        latest_checkpoint_dir = os.path.join(checkpoint_dir, "latest")
+        latest_checkpoint_files = os.listdir(latest_checkpoint_dir)
+        if latest_checkpoint_files:
+            latest_checkpoint_path = sorted(latest_checkpoint_files)[-1]
+            latest_checkpoint_path = os.path.join(
+                latest_checkpoint_dir, latest_checkpoint_path
+            )
+            start_epoch = load_checkpoint(
+                latest_checkpoint_path, model, optimizer, scheduler
+            )
+            logger.info(
+                f"Resuming training from the latest checkpoint: {latest_checkpoint_path}"
+            )
+        else:
+            logger.info(
+                "No previous checkpoints found. Starting training from scratch."
+            )
 
     best_val_loss = float("inf")
     patience_counter = 0
@@ -54,8 +135,8 @@ def train(
     # Enable mixed-precision training
     scaler = torch.cuda.amp.GradScaler()
 
-    for epoch in range(config["num_epochs"]):
-        logger.info(f"Epoch {epoch + 1}/{config['num_epochs']}")
+    for epoch in range(start_epoch, config["num_epochs"] + 1):
+        logger.info(f"Epoch {epoch}/{config['num_epochs']}")
         train_loss = 0.0
         model.train()
 
@@ -98,7 +179,7 @@ def train(
             scaler.scale(loss).backward()
 
             # Gradient accumulation
-            if batch_idx % accumulation_steps == 0:
+            if (batch_idx + 1) % accumulation_steps == 0:
                 # Gradient clipping
                 scaler.unscale_(optimizer)
                 nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -119,9 +200,17 @@ def train(
             model, val_dataloader, tokenizer, device, adjacency_matrix_sparse
         )
 
+        # Save the model as a SafeTensor
+        safetensors.torch.save_safetensors(
+            f"{model_name}_epoch_{epoch}.safetensor", model.state_dict()
+        )
+
+        # Save the checkpoint
+        save_checkpoint(epoch, model, optimizer, scheduler, checkpoint_dir, model_name)
+
         # Log the losses
-        writer.add_scalar("Loss/Train", train_loss, epoch)
-        writer.add_scalar("Loss/Validation", val_loss, epoch)
+        writer.add_scalar("Loss/Train", train_loss, epoch - 1)
+        writer.add_scalar("Loss/Validation", val_loss, epoch - 1)
 
         # Update the learning rate scheduler
         scheduler.step(val_loss)
@@ -133,12 +222,22 @@ def train(
         else:
             patience_counter += 1
             if patience_counter >= config["patience"]:
-                logger.info(f"Early stopping after {epoch + 1} epochs.")
+                logger.info(f"Early stopping after {epoch} epochs.")
                 break
 
         logger.info(
-            f"Epoch {epoch + 1}/{config['num_epochs']}: Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}"
+            f"Epoch {epoch}/{config['num_epochs']}: Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}"
         )
+
+    # Save the final model as a SafeTensor
+    safetensors.torch.save_safetensors(
+        f"{model_name}_final.safetensor", model.state_dict()
+    )
+
+    # Save the final checkpoint
+    save_checkpoint(
+        config["num_epochs"], model, optimizer, scheduler, checkpoint_dir, model_name
+    )
 
 
 def evaluate(
@@ -193,7 +292,7 @@ def evaluate(
 
     # Compute evaluation metrics
     text_prediction_metrics = evaluate_text_prediction(
-        model, tokenizer, dataloader.dataset, device
+        model, tokenizer, dataloader.dataset, device, adjacency_matrix_sparse
     )
     logger.info(f"Text Prediction Metrics: {text_prediction_metrics}")
 

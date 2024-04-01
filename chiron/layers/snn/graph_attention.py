@@ -1,3 +1,5 @@
+from typing import Optional
+
 import torch
 import torch.nn as nn
 
@@ -13,24 +15,16 @@ class GraphAttentionLayer(nn.Module):
     Args:
         in_features (int): Number of input features for each node.
         out_features (int): Number of output features for each node.
-        num_heads (int, optional): Number of attention heads. Default is 1.
-        dropout (float, optional): Dropout probability. Default is 0.0.
-        alpha (float, optional): Negative slope for the LeakyReLU activation function. Default is 0.2.
-        concat (bool, optional): If True, concatenate the output of all attention heads. Otherwise, average them. Default is True.
+        num_heads (int): Number of attention heads. Default is 1.
+        dropout (float): Dropout probability. Default is 0.0.
+        alpha (float): Negative slope for the LeakyReLU activation function. Default is 0.2.
+        concat (bool): If True, concatenate the output of all attention heads. Otherwise, average them. Default is True.
 
     Attributes:
         W (nn.Parameter): Linear transformation weight matrix for computing attention scores.
         a (nn.Parameter): Learnable attention mechanism coefficient.
         leakyrelu (nn.LeakyReLU): LeakyReLU activation function.
         dropout (nn.Dropout): Dropout layer.
-
-    Example:
-        >>> import torch
-        >>> layer = GraphAttentionLayer(in_features=128, out_features=64, num_heads=2, dropout=0.1)
-        >>> input_tensor = torch.randn(32, 10, 128)  # (batch_size, seq_len, num_features)
-        >>> output_tensor = layer(input_tensor)
-        >>> print(output_tensor.shape)
-        torch.Size([32, 10, 128])  # (batch_size, seq_len, num_heads * out_features)
     """
 
     def __init__(
@@ -41,7 +35,7 @@ class GraphAttentionLayer(nn.Module):
         dropout: float = 0.0,
         alpha: float = 0.2,
         concat: bool = True,
-    ) -> None:
+    ):
         super(GraphAttentionLayer, self).__init__()
         self.in_features = in_features
         self.out_features = out_features
@@ -59,7 +53,9 @@ class GraphAttentionLayer(nn.Module):
         nn.init.xavier_uniform_(self.W.data, gain=1.414)
 
         # Initialize the attention mechanism coefficient
-        self.a = nn.Parameter(torch.empty(size=(2 * self.out_features_per_head, 1)))
+        self.a = nn.Parameter(
+            torch.empty(size=(num_heads, 2 * self.out_features_per_head, 1))
+        )
         nn.init.xavier_uniform_(self.a.data, gain=1.414)
 
         # Initialize the LeakyReLU activation function
@@ -83,21 +79,25 @@ class GraphAttentionLayer(nn.Module):
         # Reshape the input tensor to (batch_size, num_heads, seq_len, out_features_per_head)
         input_tensor = torch.einsum("bij,hjk->bihk", input_tensor, self.W)
 
-        # Compute attention scores
-        scores = torch.einsum("bihk,bjhk->bhij", input_tensor, input_tensor)
-        scores = scores / (self.out_features_per_head**0.5)
+        # Compute the attention scores using the attention mechanism coefficient
+        attn_scores = torch.einsum(
+            "bihk,bijl->bhij", input_tensor, input_tensor.repeat(1, 1, seq_len, 1)
+        )
+        attn_scores = self.leakyrelu(attn_scores)
 
-        # Apply the LeakyReLU nonlinearity
-        scores = self.leakyrelu(scores)
+        return attn_scores
 
-        return scores
-
-    def forward(self, input_tensor: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        input_tensor: torch.Tensor,
+        adj_matrix: Optional[torch.sparse.Tensor] = None,
+    ) -> torch.Tensor:
         """
         Compute the output features for the input tensor.
 
         Args:
             input_tensor (torch.Tensor): Input tensor of shape (batch_size, seq_len, num_features).
+            adj_matrix (torch.sparse.Tensor, optional): Adjacency matrix tensor of shape (seq_len, seq_len). Default is None.
 
         Returns:
             torch.Tensor: Output tensor of shape (batch_size, seq_len, num_heads * out_features) or (batch_size, seq_len, out_features).
@@ -107,20 +107,55 @@ class GraphAttentionLayer(nn.Module):
         # Compute attention scores
         attn_scores = self._compute_attention_scores(input_tensor)
 
-        # Apply attention scores to input features
+        # Apply the adjacency matrix mask to the attention scores (if provided)
+        if adj_matrix is not None:
+            num_nodes = adj_matrix.size(0)
+            if num_nodes < seq_len:
+                indices = adj_matrix._indices()
+                values = adj_matrix._values()
+                indices = indices.clamp(max=seq_len - 1)
+                adj_matrix = torch.sparse_coo_tensor(
+                    indices,
+                    values,
+                    size=(seq_len, seq_len),
+                    device=adj_matrix.device,
+                )
+            elif num_nodes > seq_len:
+                indices = adj_matrix._indices()
+                values = adj_matrix._values()
+                mask = (indices[0] < seq_len) & (indices[1] < seq_len)
+                indices = indices[:, mask]
+                values = values[mask]
+                adj_matrix = torch.sparse_coo_tensor(
+                    indices,
+                    values,
+                    size=(seq_len, seq_len),
+                    device=adj_matrix.device,
+                )
+
+            edge_indices = adj_matrix._indices()
+            edge_indices_batch = edge_indices.unsqueeze(0).expand(batch_size, -1, -1)
+            edge_indices_head = edge_indices_batch.unsqueeze(1).expand(
+                -1, self.num_heads, -1, -1
+            )
+            mask = torch.zeros_like(attn_scores, dtype=torch.bool)
+            mask.scatter_(2, edge_indices_head, True)
+            attn_scores = attn_scores.masked_fill(~mask, float("-inf"))
+
+        # Apply softmax to normalize the attention scores
         attn_probs = nn.functional.softmax(attn_scores, dim=-1)
         attn_probs = self.dropout(attn_probs)
 
-        # Reshape the input tensor to (batch_size, num_heads, seq_len, out_features_per_head)
-        input_tensor = torch.einsum("bij,hjk->bihk", input_tensor, self.W)
+        # Reshape the input tensor to (batch_size, seq_len, num_heads, out_features_per_head)
+        input_tensor = input_tensor.view(batch_size, seq_len, self.num_heads, -1)
 
-        # Apply attention probabilities
-        attn_output = torch.einsum("bhij,bihk->bjhk", attn_probs, input_tensor)
+        # Apply attention probabilities to the input tensor
+        attn_output = torch.einsum("bhij,bjhk->bihk", attn_probs, input_tensor)
 
-        # Reshape the output tensor
+        # Reshape the attention output
         if self.concat:
             attn_output = attn_output.reshape(
-                batch_size, seq_len, self.num_heads * self.out_features_per_head
+                batch_size, seq_len, self.num_heads * attn_output.size(-1)
             )
         else:
             attn_output = attn_output.mean(dim=1)

@@ -14,18 +14,20 @@
   "max_sequence_length": 1000000,
   "preprocessing_params": {
     "min_freq": 5,
-    "max_vocab_size": 10000
+    "max_vocab_size": 1000
   },
   "embedding_params": {
-    "vector_size": 200,
+    "vector_size": 300,
     "window": 5,
-    "min_count": 2,
-    "workers": 8
+    "min_count": 1,
+    "workers": 4,
+    "model_path": ".w2v_models/GoogleNews-vectors-negative300.bin"
   },
   "sdr_params": {
-    "pca_components": 64,
+    "projection_dimensions": 64,
     "sdr_dimensions": 128,
-    "sparsity": 0.02
+    "sparsity": 0.002,
+    "use_gpu": true
   },
   "htm_params": {
     "input_size": 128,
@@ -59,15 +61,15 @@
     "concat": true
   },
   "device": "cuda:0",
-  "batch_size": 512,
+  "batch_size": 205600,
   "num_epochs": 20,
   "learning_rate": 0.0001,
-  "adjacency_matrix": {
-    "threshold": 0.7,
-    "subsample_rate": 0.05,
-    "n_jobs": 100,
-    "chunk_size": 10000
-  },
+    "adjacency_matrix": {
+        "threshold": 0.5,
+        "subsample_rate": 0.2,
+        "num_permutations": 128,
+        "lsh_bucket_size": 128
+    },
   "labels": [],
   "accumulation_steps": 16,
   "checkpoint_dir": ".checkpoints",

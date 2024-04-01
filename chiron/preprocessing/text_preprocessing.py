@@ -1,9 +1,13 @@
+# text_preprocessing.py
+
 import concurrent.futures
 import random
 import re
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 from typing import List, Dict, Any
 
+import numpy as np
 from loguru import logger
 from nltk.corpus import wordnet
 from tqdm import tqdm
@@ -49,21 +53,21 @@ class TextPreprocessor:
         """
         return text.split()
 
-    @staticmethod
-    def count_token_frequencies(tokenized_texts: List[List[str]]) -> Counter:
+    @classmethod
+    def count_token_frequencies(cls, tokenized_texts: List[str]) -> Counter:
         """
         Count token frequencies in the tokenized texts using ThreadPoolExecutor.
 
         Args:
-            tokenized_texts (List[List[str]]): List of tokenized texts.
+            tokenized_texts (List[str]): List of tokenized texts.
 
         Returns:
             Counter: Token frequency counts.
         """
-        with concurrent.futures.ThreadPoolExecutor() as executor:
+        with ThreadPoolExecutor() as executor:
             futures = [
-                executor.submit(lambda: Counter(text))
-                for text in tqdm(tokenized_texts, desc="submitting tasks...")
+                executor.submit(lambda tokens=tokens: Counter(tokens))
+                for tokens in tqdm(tokenized_texts, desc="Submitting tasks...")
             ]
 
             token_counts = Counter()
@@ -76,12 +80,12 @@ class TextPreprocessor:
 
         return token_counts
 
-    def build_vocabulary(self, tokenized_texts: List[List[str]]) -> None:
+    def build_vocabulary(self, tokenized_texts: List[str]) -> None:
         """
         Build a vocabulary from the tokenized texts, handling special tokens and frequency thresholds.
 
         Args:
-            tokenized_texts (List[List[str]]): List of tokenized texts.
+            tokenized_texts (List[str]): List of tokenized texts.
         """
         token_counts = self.count_token_frequencies(tokenized_texts)
 
@@ -90,11 +94,11 @@ class TextPreprocessor:
         for token, count in tqdm(
             token_counts.most_common(self.max_vocab_size - 2),
             desc="Building vocabulary",
-        ):  # noqa: E501
+        ):
             if count >= self.min_freq:
                 self.vocab[token] = len(self.vocab)
 
-        logger.debug(f"vocab: {len(self.vocab)} entries")
+        logger.debug(f"Vocabulary size: {len(self.vocab)} entries")
 
     @staticmethod
     def validate_batch(batch: List[Dict[str, Any]]) -> bool:
@@ -112,7 +116,8 @@ class TextPreprocessor:
             for item in batch
         )
 
-    def augment_text(self, text: str) -> str:
+    @classmethod
+    def augment_text(cls, text: str) -> str:
         """
         Augment the input text by applying random transformations.
 
@@ -145,48 +150,33 @@ class TextPreprocessor:
         augmented_text = " ".join(augmented_words)
         return augmented_text
 
-    def preprocess_text_batch(self, batch: dict) -> List[List[str]]:
+    def preprocess_text_batch(self, batch: List[List[Dict[str, Any]]]) -> List[str]:
         preprocessed_batch = []
-        # for batch in batches:
-        human = ""
-        ai = ""
         for dict_list in batch:
+            human = ""
+            ai = ""
             for text_dict in dict_list:
-                human = (
-                    text_dict.get("value", "")
-                    if text_dict.get("from") == "human"
-                    else ""
-                )
-                ai = text_dict.get("value", "") if text_dict.get("from") == "ai" else ""
+                if isinstance(text_dict, dict):
+                    human = (
+                        text_dict.get("value", "")
+                        if text_dict.get("from") == "human"
+                        else human
+                    )
+                    ai = (
+                        text_dict.get("value", "")
+                        if text_dict.get("from") == "ai"
+                        else ai
+                    )
 
             final = f"\nhuman:\n{human}\nai:\n{ai}\n"
-            preprocessed_text = self.preprocess_text(final)
-            augmented_text = self.augment_text(
-                preprocessed_text
-            )  # Apply data augmentation
+            preprocessed_text = self.preprocess_text_helper(final)
+            augmented_text = self.augment_text(preprocessed_text)
             tokenized_text = self.tokenize_text(augmented_text)
-            preprocessed_batch.append(tokenized_text)
+            preprocessed_batch.append(" ".join(tokenized_text))
 
         return preprocessed_batch
 
-    # chiron/preprocessing/text_preprocessing.py
-    def preprocess(
-        self, conversations: List[List[Dict[str, Any]]], cache_key: str
-    ) -> List[List[str]]:
-        preprocessed_data = load_cached_data(cache_key)
-        if preprocessed_data is None:
-            preprocessed_data = []
-            for conversation in conversations:
-                preprocessed_conversation = []
-                for turn in conversation:
-                    text = turn["value"]
-                    preprocessed_text = self.preprocess_text(text)
-                    preprocessed_conversation.append(preprocessed_text)
-                preprocessed_data.append(preprocessed_conversation)
-            cache_data(preprocessed_data, cache_key)
-        return preprocessed_data
-
-    def preprocess_text(self, text: str) -> List[str]:
+    def preprocess_text_helper(self, text: str) -> str:
         """
         Preprocess a single text by lowercasing, removing punctuation, and handling special characters.
 
@@ -194,15 +184,45 @@ class TextPreprocessor:
             text (str): Input text.
 
         Returns:
-            List[str]: Preprocessed text as a list of tokens.
+            str: Preprocessed text.
         """
-        preprocessed_text = self.preprocess_text_helper(text)
-        augmented_text = self.augment_text(preprocessed_text)
-        tokenized_text = self.tokenize_text(augmented_text)
-        return tokenized_text
-
-    def preprocess_text_helper(self, text: str) -> str:
         text = text.lower()
         text = re.sub(r"[^\w\s]", "", text)
         text = re.sub(r"\d", "<NUM>", text)
         return text
+
+    def preprocess(
+        self, conversations: List[List[Dict[str, Any]]], cache_key: str
+    ) -> List[str]:
+        preprocessed_data = load_cached_data(cache_key)
+        if preprocessed_data is None:
+            preprocessed_data = []
+            for conversation in conversations:
+                if self.validate_batch(conversation):
+                    preprocessed_conversation = self.preprocess_text_batch(conversation)
+                    preprocessed_data.extend(preprocessed_conversation)
+            cache_data(preprocessed_data, cache_key)
+        return preprocessed_data
+
+    def _process_batch(self, batch: List[str]) -> List[np.ndarray]:
+        """
+        Process a batch of tokenized texts and generate embeddings.
+
+        Args:
+            batch (List[str]): Batch of tokenized texts.
+
+        Returns:
+            List[np.ndarray]: List of word embeddings for each text in the batch.
+        """
+        batch_embeddings = []
+        for text in batch:
+            # Check if token is a string and exists in the Word2Vec model
+            if isinstance(text, str) and text in self.model.key_to_index:
+                batch_embeddings.append(self.model.get_vector(text))
+            else:
+                # Handle unknown tokens or non-string tokens
+                # Use a default embedding of zeros
+                default_embedding = np.zeros(self.vector_size, dtype=np.float32)
+                batch_embeddings.append(default_embedding)
+
+        return batch_embeddings
