@@ -80,7 +80,7 @@ def train(
     checkpoint_dir: str = ".checkpoints",
     resume_from_latest: bool = True,
     model_name: str = "snn_model",
-) -> None:
+) -> tuple:
     """
     Train the SNNModel on the given datasets.
 
@@ -96,6 +96,9 @@ def train(
         checkpoint_dir (str): The directory to save checkpoints.
         resume_from_latest (bool): Whether to resume training from the latest checkpoint.
         model_name (str): The name of the model.
+
+    Returns:
+        tuple: A tuple containing lists of training and validation losses for each epoch.
     """
     optimizer = torch.optim.Adam(model.parameters(), lr=config["learning_rate"])
     criterion = nn.NLLLoss()
@@ -134,6 +137,10 @@ def train(
 
     # Enable mixed-precision training
     scaler = torch.cuda.amp.GradScaler()
+
+    # Initialize lists to store training and validation losses
+    train_losses = []
+    val_losses = []
 
     for epoch in range(start_epoch, config["num_epochs"] + 1):
         logger.info(f"Epoch {epoch}/{config['num_epochs']}")
@@ -194,11 +201,13 @@ def train(
 
         # Compute the average training loss
         train_loss /= len(train_dataloader)
+        train_losses.append(train_loss)
 
         # Evaluate on the validation set
         val_loss = evaluate(
             model, val_dataloader, tokenizer, device, adjacency_matrix_sparse
         )
+        val_losses.append(val_loss)
 
         # Save the model as a SafeTensor
         safetensors.torch.save_safetensors(
@@ -239,20 +248,30 @@ def train(
         config["num_epochs"], model, optimizer, scheduler, checkpoint_dir, model_name
     )
 
+    return train_losses, val_losses
 
+
+# chiron/train.py
 def evaluate(
     model: SNNModel,
     dataloader: DataLoader,
     tokenizer: PreTrainedTokenizer,
     device: torch.device,
-    adjacency_matrix_sparse: torch.sparse_coo_tensor,
+    adjacency_matrix_sparse: torch.sparse.Tensor,
 ) -> float:
+    """
+    Evaluate the model on the given dataset.
+    Args:
+        model (SNNModel): The model to evaluate.
+        dataloader (DataLoader): The data loader for evaluation.
+        tokenizer (PreTrainedTokenizer): The tokenizer for the language model.
+        device (torch.device): The device to run the evaluation on.
+        adjacency_matrix_sparse (torch.sparse.Tensor): The adjacency matrix in sparse format.
+    Returns:
+        float: The average loss on the evaluation dataset.
+    """
     model.eval()
-    criterion = nn.NLLLoss()
-    num_classes = (
-        model.output_size
-    )  # Assuming output_size represents the number of classes
-    node_to_class_mapping = {i: i % num_classes for i in range(num_classes)}
+    criterion = nn.CrossEntropyLoss(reduction="mean")  # Use mean reduction
     total_loss = 0.0
 
     with torch.no_grad():
@@ -263,27 +282,19 @@ def evaluate(
             # Move the input tensors and labels to the device
             input_ids = input_ids.to(device)
             attention_mask = attention_mask.to(device)
+            label = label.to(device)
             node_indices = node_indices.to(device)
 
-            # Clamp node_indices to the valid range
-            node_indices = node_indices.clamp(min=0, max=num_classes - 1)
-
-            # Convert node_indices to class indices using the mapping
-            class_indices = torch.tensor(
-                [node_to_class_mapping[idx.item()] for idx in node_indices],
-                device=device,
-            )
+            # Ensure the label tensor is 1D
+            label = label.squeeze()
 
             # Forward pass
             outputs = model(
                 input_ids, attention_mask, adjacency_matrix_sparse, node_indices
             )
 
-            # Reshape outputs to match the shape of class_indices
-            outputs = outputs.view(-1, num_classes)
-
             # Compute the loss
-            loss = criterion(outputs, class_indices)
+            loss = criterion(outputs.view(-1, outputs.size(-1)), label)
 
             # Accumulate the loss
             total_loss += loss.item()
