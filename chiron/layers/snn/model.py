@@ -1,140 +1,13 @@
 # chiron/layers/snn/model.py
+from typing import Optional, Generator
+
 import torch
 import torch.nn as nn
 from loguru import logger
-from tqdm import tqdm
 from transformers import PreTrainedTokenizer
 
 from chiron.layers.htm.model import HTMModel
 from chiron.layers.snn.graph_attention import GraphAttentionLayer
-
-
-def batch_cosine_similarity(
-    sdr_embeddings: torch.Tensor, threshold: float = 0.5, batch_size: int = 1000
-) -> torch.Tensor:
-    """
-    Computes cosine similarity in batches and directly produces a sparse matrix to avoid memory overflow.
-
-    Args:
-        sdr_embeddings (torch.Tensor): SDR embeddings of shape (N, D) where N is the number of embeddings and D is the dimension.
-        threshold (float): Cosine similarity threshold to consider two vectors as connected.
-        batch_size (int): The size of each batch for computation.
-
-    Returns:
-        torch.sparse.Tensor: A sparse matrix of cosine similarities above the threshold.
-    """
-    num_embeddings = sdr_embeddings.size(0)
-    device = sdr_embeddings.device
-
-    indices = []
-    values = []
-
-    for i in tqdm(
-        range(0, num_embeddings, batch_size), desc="Computing cosine similarity"
-    ):
-        batch_end = min(i + batch_size, num_embeddings)
-        batch = sdr_embeddings[i:batch_end]
-
-        # Efficient computation of cosine similarity using matrix multiplication
-        similarity = torch.mm(batch, sdr_embeddings.t())
-
-        # Convert to sparse format immediately to save memory
-        batch_indices = torch.nonzero(similarity > threshold, as_tuple=False).t()
-        batch_values = similarity[similarity > threshold]
-
-        # Adjust indices for the current batch
-        batch_indices[0] += i
-
-        indices.append(batch_indices)
-        values.append(batch_values)
-
-    # Concatenate all indices and values
-    indices = torch.cat(indices, dim=1)
-    values = torch.cat(values, dim=0)
-
-    # Create the final sparse matrix
-    similarity_matrix_sparse = torch.sparse_coo_tensor(
-        indices,
-        values,
-        (num_embeddings, num_embeddings),
-        device=device,
-    )
-
-    return similarity_matrix_sparse
-
-
-def create_adjacency_matrix(
-    sdr_embeddings: torch.Tensor, threshold: float = 0.5
-) -> torch.sparse.Tensor:
-    """
-    Generates an adjacency matrix from SDR embeddings using cosine similarity.
-
-    Args:
-        sdr_embeddings (torch.Tensor): The SDR embeddings tensor of shape (N, D).
-        threshold (float): Threshold for considering two embeddings as neighbors.
-
-    Returns:
-        torch.sparse.Tensor: The adjacency matrix as a sparse COO tensor.
-    """
-    # Normalize embeddings to unit vectors for cosine similarity calculation
-    sdr_embeddings = sdr_embeddings / sdr_embeddings.norm(dim=1, keepdim=True)
-
-    # Compute cosine similarity matrix
-    similarity_matrix = torch.matmul(sdr_embeddings, sdr_embeddings.t())
-
-    # Apply threshold to create a binary adjacency matrix
-    adjacency_matrix = (similarity_matrix > threshold).float()
-
-    # Convert the adjacency matrix to a sparse COO tensor
-    indices = torch.nonzero(adjacency_matrix).t()
-    values = adjacency_matrix[indices[0], indices[1]]
-    adjacency_matrix_sparse = torch.sparse_coo_tensor(
-        indices, values, adjacency_matrix.size()
-    )
-
-    return adjacency_matrix_sparse
-
-
-def create_adjacency_matrix_batched(
-    sdr_embeddings: torch.Tensor, threshold: float = 0.5, batch_size: int = 10000
-) -> torch.sparse.Tensor:
-    num_embeddings = sdr_embeddings.size(0)
-    indices = []
-    values = []
-
-    # Normalize embeddings to unit vectors for cosine similarity calculation
-    sdr_embeddings = sdr_embeddings / sdr_embeddings.norm(dim=1, keepdim=True)
-
-    num_batches = (num_embeddings + batch_size - 1) // batch_size
-    progress_bar = tqdm(total=num_batches, desc="Computing adjacency matrix")
-
-    for i in range(0, num_embeddings, batch_size):
-        batch_end = min(i + batch_size, num_embeddings)
-        batch_embeddings = sdr_embeddings[i:batch_end]
-
-        # Compute cosine similarity for the current batch
-        similarity_matrix = torch.einsum("nd,md->nm", batch_embeddings, sdr_embeddings)
-
-        # Apply threshold and convert to sparse format
-        batch_indices = torch.nonzero(similarity_matrix > threshold).t()
-        batch_values = similarity_matrix[batch_indices[0], batch_indices[1]]
-
-        indices.append(batch_indices)
-        values.append(batch_values)
-
-        progress_bar.update(1)
-
-    progress_bar.close()
-
-    # Concatenate indices and values from all batches
-    indices = torch.cat(indices, dim=1)
-    values = torch.cat(values)
-
-    adjacency_matrix_sparse = torch.sparse_coo_tensor(
-        indices, values, (num_embeddings, num_embeddings)
-    )
-
-    return adjacency_matrix_sparse
 
 
 class SNNLayer(nn.Module):
@@ -143,12 +16,12 @@ class SNNLayer(nn.Module):
     """
 
     def __init__(
-        self,
-        hidden_size: int,
-        output_size: int,
-        timesteps: int,
-        num_nodes: int,
-        dropout: float = 0.0,
+            self,
+            hidden_size: int,
+            output_size: int,
+            timesteps: int,
+            num_nodes: int,
+            dropout: float = 0.0,
     ):
         super(SNNLayer, self).__init__()
         self.hidden_size = hidden_size
@@ -169,7 +42,7 @@ class SNNLayer(nn.Module):
         x = x.to(dtype=self.fc2.weight.dtype, device=x.device)
 
         if (
-            x.dim() == 2
+                x.dim() == 2
         ):  # If input is 2D (batch_size, feature_size), add a sequence dimension
             x = x.unsqueeze(1)  # Reshape to (batch_size, 1, feature_size)
 
@@ -214,14 +87,14 @@ class SNNModel(nn.Module):
     """
 
     def __init__(
-        self,
-        sp_params: dict,
-        gat_params: dict,
-        htm_params: dict,
-        device: torch.device,
-        vocab: dict,
-        tokenizer: PreTrainedTokenizer,
-        snn_params: dict,
+            self,
+            sp_params: dict,
+            gat_params: dict,
+            htm_params: dict,
+            device: torch.device,
+            vocab: dict,
+            tokenizer: PreTrainedTokenizer,
+            snn_params: dict,
     ):
         super(SNNModel, self).__init__()
         self.sp_params = sp_params
@@ -260,31 +133,32 @@ class SNNModel(nn.Module):
         )
 
     def forward(
-        self,
-        input_ids: torch.Tensor,
-        attention_mask: torch.Tensor,
-        adj_matrix: torch.sparse_coo_tensor,
-        node_indices: torch.Tensor,
+            self,
+            input_ids: torch.Tensor,
+            attention_mask: torch.Tensor,
+            adj_matrix_batches: Optional[Generator[torch.Tensor, None, None]] = None,
+            node_indices: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Perform the forward pass of the SNN model.
         Args:
             input_ids (torch.Tensor): The input token IDs tensor of shape (batch_size, seq_len) or (batch_size,).
             attention_mask (torch.Tensor): The attention mask tensor of shape (batch_size, seq_len) or (batch_size,).
-            adj_matrix (torch.sparse_coo_tensor): The adjacency matrix in sparse COO format.
-            node_indices (torch.Tensor): The node indices tensor.
+                This parameter is not used in the current implementation, but it is kept for future compatibility.
+            adj_matrix_batches (Generator[torch.Tensor, None, None], optional): The generator of batch adjacency matrix tensors.
+                Each batch tensor has shape (num_embeddings, num_embeddings).
+            node_indices (torch.Tensor, optional): The node indices tensor.
+                This parameter is not used in the current implementation, but it is kept for future compatibility.
         Returns:
             torch.Tensor: The output tensor of shape (batch_size, output_size).
         """
         logger.debug(f"Input tensor shape: {input_ids.shape}")
         logger.debug(f"Attention mask shape: {attention_mask.shape}")
-        logger.debug(f"Adjacency matrix shape: {adj_matrix.shape}")
         logger.debug(f"Node indices shape: {node_indices.shape}")
 
         # Add an extra dimension if input_ids is 1D
         if input_ids.ndim == 1:
             input_ids = input_ids.unsqueeze(0)
-            attention_mask = attention_mask.unsqueeze(0)
 
         batch_size, seq_len = input_ids.size()
 
@@ -296,12 +170,24 @@ class SNNModel(nn.Module):
         snn_output = self.snn_layer(input_ids)
         logger.debug(f"SNN output shape: {snn_output.shape}")
 
-        # Apply the GAT layer
-        gat_output = self.gat_layer(snn_output, adj_matrix)
-        logger.debug(f"GAT output shape: {gat_output.shape}")
+        # Initialize an empty tensor to store the accumulated GAT output
+        accumulated_gat_output = torch.zeros_like(snn_output)
+
+        # Process each batch adjacency matrix tensor
+        for batch_adj_matrix in adj_matrix_batches:
+            # Apply the GAT layer
+            gat_output = self.gat_layer(snn_output, batch_adj_matrix)
+            logger.debug(f"GAT output shape: {gat_output.shape}")
+
+            # Accumulate the GAT output
+            accumulated_gat_output += gat_output
+
+        # Compute the average GAT output
+        avg_gat_output = accumulated_gat_output / len(adj_matrix_batches)
+        logger.debug(f"Average GAT output shape: {avg_gat_output.shape}")
 
         # Apply the HTM layer
-        htm_output = self.htm_layer(gat_output).view(batch_size, -1)
+        htm_output = self.htm_layer(avg_gat_output).view(batch_size, -1)
         logger.debug(f"HTM output shape: {htm_output.shape}")
 
         # Apply the final fully connected layer
@@ -376,11 +262,19 @@ class SNNModel(nn.Module):
                 # Forward pass
                 if adjacency_matrix is None or node_indices is None:
                     # If adjacency_matrix or node_indices are not provided, create dummy values
-                    dummy_adj_matrix = torch.eye(input_ids.size(-1), dtype=torch.bool).to(self.device)
-                    dummy_node_indices = torch.arange(input_ids.size(-1), device=self.device)
-                    output = self.forward(input_ids, attention_mask, dummy_adj_matrix, dummy_node_indices)
+                    dummy_adj_matrix = torch.eye(
+                        input_ids.size(-1), dtype=torch.bool
+                    ).to(self.device)
+                    dummy_node_indices = torch.arange(
+                        input_ids.size(-1), device=self.device
+                    )
+                    output = self.forward(
+                        input_ids, attention_mask, dummy_adj_matrix, dummy_node_indices
+                    )
                 else:
-                    output = self.forward(input_ids, attention_mask, adjacency_matrix, node_indices)
+                    output = self.forward(
+                        input_ids, attention_mask, adjacency_matrix, node_indices
+                    )
 
                 # Sample from the model's output distribution
                 output_logits = output[:, -1, :] / temperature
@@ -405,7 +299,11 @@ class SNNModel(nn.Module):
                 response.append(next_token.item())
                 input_ids = torch.cat([input_ids, next_token], dim=-1)
                 attention_mask = torch.cat(
-                    [attention_mask, torch.tensor([1], device=self.device, dtype=torch.long)], dim=-1
+                    [
+                        attention_mask,
+                        torch.tensor([1], device=self.device, dtype=torch.long),
+                    ],
+                    dim=-1,
                 )
 
             # Add the generated response to the conversation
@@ -465,8 +363,8 @@ class SNNModel(nn.Module):
             sorted_indices_to_remove = cumulative_probs > top_p
             # Shift the indices to the right to keep also the first token above the threshold
             sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[
-                ..., :-1
-            ].clone()
+                                                ..., :-1
+                                                ].clone()
             sorted_indices_to_remove[..., 0] = 0
 
             # Convert from sorted indices to original indices

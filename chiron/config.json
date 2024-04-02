@@ -2,7 +2,7 @@
   "dataset_params": {
     "dataset_name": "teknium/OpenHermes-2.5",
     "dataset_config": "default",
-    "split": "train[:1%]"
+    "split": "train[:25%]"
   },
   "longformer_params": {
     "hidden_size": 768,
@@ -25,7 +25,7 @@
   },
   "sdr_params": {
     "projection_dimensions": 64,
-    "sdr_dimensions": 128,
+    "sdr_dimensions": 256,
     "sparsity": 0.002,
     "use_gpu": true
   },
@@ -61,15 +61,17 @@
     "concat": true
   },
   "device": "cuda:0",
-  "batch_size": 205600,
+  "batch_size": 2056,
   "num_epochs": 20,
   "learning_rate": 0.0001,
   "adjacency_matrix": {
     "threshold": 0.5,
-    "subsample_rate": 0.2,
+    "num_projections": 64,
+    "seed": 42,
+    "subsample_rate": 0.02,
     "num_permutations": 128,
     "lsh_bucket_size": 128,
-    "batch_size": 5000
+    "batch_size": 10000
   },
   "labels": [],
   "accumulation_steps": 16,

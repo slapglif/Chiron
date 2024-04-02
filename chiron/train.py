@@ -251,7 +251,6 @@ def train(
     return train_losses, val_losses
 
 
-# chiron/train.py
 def evaluate(
     model: SNNModel,
     dataloader: DataLoader,
@@ -286,7 +285,7 @@ def evaluate(
             node_indices = node_indices.to(device)
 
             # Ensure the label tensor is 1D
-            label = label.squeeze()
+            label = label.squeeze(1)
 
             # Forward pass
             outputs = model(
@@ -294,7 +293,7 @@ def evaluate(
             )
 
             # Compute the loss
-            loss = criterion(outputs.view(-1, outputs.size(-1)), label)
+            loss = criterion(outputs.view(-1, outputs.size(-1)), label.view(-1))
 
             # Accumulate the loss
             total_loss += loss.item()

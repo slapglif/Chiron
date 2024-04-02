@@ -11,16 +11,17 @@ import numpy as np
 import torch
 from datasets import load_dataset as data_load
 from loguru import logger
+from scipy.sparse import coo_matrix
+from sklearn.impute import SimpleImputer
 from sklearn.model_selection import KFold
+from sklearn.random_projection import SparseRandomProjection
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
+from tqdm import tqdm
 from transformers import BertTokenizer
 
 from chiron.layers.sdr.sdr_generation import SDRGenerator
-from chiron.layers.snn.model import (
-    SNNModel,
-    create_adjacency_matrix_batched,
-)
+from chiron.layers.snn.model import SNNModel
 from chiron.preprocessing.embedding import Word2VecEmbedding
 from chiron.preprocessing.text_preprocessing import TextPreprocessor
 from chiron.train import train
@@ -78,6 +79,113 @@ def build_vocab(
     return vocab
 
 
+def lsh_cosine_similarity(
+        sdr_embeddings: torch.Tensor,
+        threshold: float = 0.5,
+        num_projections: int = 128,
+        seed: int = 42,
+        chunk_size: int = 1000,  # Number of embeddings to process at a time
+        batch_size: int = 10000,  # Number of rows to process in each batch
+) -> torch.Tensor:
+    num_embeddings = sdr_embeddings.size(0)
+    device = sdr_embeddings.device
+
+    # Normalize embeddings to unit vectors for cosine similarity calculation
+    sdr_embeddings_normalized = sdr_embeddings / sdr_embeddings.norm(
+        dim=1, keepdim=True
+    )
+
+    # Convert embeddings to numpy array
+    sdr_embeddings_numpy = sdr_embeddings_normalized.cpu().numpy()
+
+    # Create an imputer transformer
+    imputer = SimpleImputer(strategy="mean")
+
+    # Impute missing values
+    sdr_embeddings_imputed = imputer.fit_transform(sdr_embeddings_numpy)
+
+    # Create random projection matrix for LSH
+    random_projection = SparseRandomProjection(
+        n_components=num_projections, random_state=seed
+    )
+
+    # Project embeddings using random projection
+    projected_embeddings = random_projection.fit_transform(sdr_embeddings_imputed)
+
+    # Compute hash codes for projected embeddings
+    hash_codes = np.sign(projected_embeddings).astype(np.int32)
+    hash_codes = np.ascontiguousarray(hash_codes)  # Ensure C-contiguity
+
+    # Initialize lists to store the sparse matrix indices and values
+    row_indices = []
+    col_indices = []
+    values = []
+
+    # Process the adjacency matrix in batches
+    for i in tqdm(range(0, num_embeddings, batch_size), desc="Processing batches"):
+        start = i
+        end = min(i + batch_size, num_embeddings)
+
+        # Compute Hamming distances and populate the adjacency matrix in chunks
+        for j in range(start, end, chunk_size):
+            chunk_start = j
+            chunk_end = min(j + chunk_size, end)
+
+            # Process the embeddings in chunks
+            for k in range(chunk_start, chunk_end):
+                # Compute Hamming distances using memory-efficient operations
+                hamming_distances_chunk = np.sum(
+                    hash_codes[k] != hash_codes[start:end], axis=1
+                )
+                estimated_cosine_similarity_chunk = 1 - hamming_distances_chunk / (
+                        num_projections * 2
+                )
+
+                # Threshold the estimated cosine similarity and store the indices and values
+                mask = estimated_cosine_similarity_chunk >= threshold
+                row_indices.extend([k] * np.count_nonzero(mask))
+                col_indices.extend(np.where(mask)[0] + start)
+                values.extend(estimated_cosine_similarity_chunk[mask])
+
+        # Create a sparse matrix for the current batch
+        batch_adjacency_matrix = coo_matrix(
+            (values, (row_indices, col_indices)), shape=(num_embeddings, num_embeddings)
+        )
+
+        # Convert the batch adjacency matrix to a sparse COO tensor
+        indices = (
+            torch.from_numpy(
+                np.vstack((batch_adjacency_matrix.row, batch_adjacency_matrix.col))
+            )
+            .long()
+            .to(device)
+        )
+        values = torch.from_numpy(batch_adjacency_matrix.data).float().to(device)
+        batch_adjacency_matrix_tensor = torch.sparse_coo_tensor(
+            indices, values, (num_embeddings, num_embeddings), device=device
+        )
+
+        # Yield the batch adjacency matrix tensor
+        yield batch_adjacency_matrix_tensor
+
+        # Clear the lists for the next batch
+        row_indices.clear()
+        col_indices.clear()
+        values.clear()
+
+
+def create_adjacency_matrix_lsh(
+        sdr_embeddings: torch.Tensor,
+        threshold: float = 0.5,
+        num_projections: int = 128,
+        seed: int = 42,
+) -> torch.sparse.Tensor:
+    adjacency_matrix_sparse = lsh_cosine_similarity(
+        sdr_embeddings, threshold, num_projections, seed
+    )
+    return adjacency_matrix_sparse
+
+
 def main(config_path: str) -> None:
     """
     Main function to run the Semantic Folding training pipeline with k-fold cross-validation.
@@ -93,7 +201,7 @@ def main(config_path: str) -> None:
     # Initialize Neptune run
     run = neptune.init_run(
         project="AnunaChiron/Chiron",
-        api_token=config.get('neptune_key'),
+        api_token=config.get("neptune_key"),
     )
 
     # Log hyperparameters
@@ -153,9 +261,14 @@ def main(config_path: str) -> None:
     logger.info("Creating adjacency matrix...")
     device = torch.device(config["device"])
     sdr_embeddings_tensor = torch.from_numpy(sdr_embeddings).float().to(device)
-    adjacency_matrix_sparse = create_adjacency_matrix_batched(
-        sdr_embeddings_tensor, threshold=config["adjacency_matrix"]["threshold"],
-        batch_size=config["adjacency_matrix"]["batch_size"]
+
+    # Create an adjacency matrix using LSH
+    logger.info("Creating adjacency matrix using LSH...")
+    adjacency_matrix_sparse = create_adjacency_matrix_lsh(
+        sdr_embeddings_tensor,
+        threshold=config["adjacency_matrix"]["threshold"],
+        num_projections=config["adjacency_matrix"]["num_projections"],
+        seed=config["adjacency_matrix"]["seed"],
     )
 
     tokenizer = BertTokenizer.from_pretrained(config["tokenizer"]["name"])

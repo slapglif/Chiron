@@ -3,6 +3,8 @@ from sklearn.decomposition import TruncatedSVD
 from loguru import logger
 from typing import List, Optional, Union
 
+from tqdm import tqdm
+
 
 class SDRGenerator:
     """
@@ -79,9 +81,12 @@ class SDRGenerator:
 
             # Binarize the reduced embeddings to generate SDRs
             threshold = np.percentile(reduced_embeddings, (1 - self.sparsity) * 100)
-            sdr_embeddings = (reduced_embeddings >= threshold).astype(int)
+            sdr_embeddings = []
+            for embedding in tqdm(reduced_embeddings, desc="Generating SDRs"):
+                sdr_embedding = (embedding >= threshold).astype(int)
+                sdr_embeddings.append(sdr_embedding)
 
-            return sdr_embeddings
+            return np.array(sdr_embeddings)
 
         except Exception as e:
             logger.error(f"An unexpected error occurred during SDR generation: {e}")
