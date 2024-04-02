@@ -70,6 +70,7 @@ class SNNLayer(nn.Module):
 
         # chiron/layers/snn/model.py
 
+
 # chiron/layers/snn/model.py
 
 class SNNModel(nn.Module):
@@ -181,14 +182,26 @@ class SNNModel(nn.Module):
                 # Ensure the batch adjacency matrix has the correct shape
                 expected_shape = (seq_len, seq_len)
                 if batch_adj_matrix.shape != expected_shape:
-                    # If the batch adjacency matrix has a different shape, convert it to a dense tensor and slice it
+                    # If the batch adjacency matrix has a different shape, convert it to a dense tensor
                     try:
-                        batch_adj_matrix = batch_adj_matrix.to_dense()[:seq_len, :seq_len]
-                    except RuntimeError:
+                        batch_adj_matrix = batch_adj_matrix.to_dense()
+                    except RuntimeError as e:
                         raise ValueError(
                             f"Batch adjacency matrix shape {batch_adj_matrix.shape} "
                             f"is incompatible with the expected shape {expected_shape}"
+                        ) from e
+
+                    # Check if the dense batch adjacency matrix can fit in GPU memory
+                    dense_size = batch_adj_matrix.numel() * batch_adj_matrix.element_size()
+                    available_mem = torch.cuda.mem_get_info(self.device)[0]
+                    if dense_size > available_mem:
+                        raise ValueError(
+                            f"Dense batch adjacency matrix of size {dense_size} bytes "
+                            f"is too large to fit in GPU memory (available: {available_mem} bytes)"
                         )
+
+                    # Slice the dense batch adjacency matrix to the expected shape
+                    batch_adj_matrix = batch_adj_matrix[:seq_len, :seq_len]
 
                 # Apply the GAT layer
                 gat_output = self.gat_layer(snn_output, batch_adj_matrix)
