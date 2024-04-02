@@ -181,10 +181,10 @@ class SNNModel(nn.Module):
                 # Ensure the batch adjacency matrix has the correct shape
                 expected_shape = (seq_len, seq_len)
                 if batch_adj_matrix.shape != expected_shape:
-                    # If the batch adjacency matrix has a different shape, try to slice it
+                    # If the batch adjacency matrix has a different shape, convert it to a dense tensor and slice it
                     try:
-                        batch_adj_matrix = batch_adj_matrix[:seq_len, :seq_len]
-                    except IndexError:
+                        batch_adj_matrix = batch_adj_matrix.to_dense()[:seq_len, :seq_len]
+                    except RuntimeError:
                         raise ValueError(
                             f"Batch adjacency matrix shape {batch_adj_matrix.shape} "
                             f"is incompatible with the expected shape {expected_shape}"
