@@ -61,9 +61,7 @@ class GraphAttentionLayer(nn.Module):
         input_tensor = input_tensor.view(batch_size, seq_len, self.num_heads, -1)
 
         # Compute the attention scores using the attention mechanism coefficient
-        attn_scores = torch.einsum(
-            "bihk,bjhk->bhij", input_tensor, input_tensor
-        )
+        attn_scores = torch.einsum("bihk,bjhk->bhij", input_tensor, input_tensor)
         attn_scores = self.leakyrelu(attn_scores)
 
         return attn_scores

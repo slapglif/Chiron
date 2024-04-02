@@ -58,7 +58,8 @@
     "num_heads": 2,
     "dropout": 0.3,
     "alpha": 0.2,
-    "concat": true
+    "concat": true,
+    "chunk_size": 1024
   },
   "device": "cuda:0",
   "batch_size": 2056,

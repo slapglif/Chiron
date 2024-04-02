@@ -17,12 +17,12 @@ class SNNLayer(nn.Module):
     """
 
     def __init__(
-            self,
-            input_size: int,
-            hidden_size: int,
-            output_size: int,
-            timesteps: int,
-            dropout: float = 0.0,
+        self,
+        input_size: int,
+        hidden_size: int,
+        output_size: int,
+        timesteps: int,
+        dropout: float = 0.0,
     ):
         super(SNNLayer, self).__init__()
         self.input_size = input_size
@@ -35,6 +35,15 @@ class SNNLayer(nn.Module):
         self.dropout_layer = nn.Dropout(dropout)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Perform the forward pass of the SNN layer.
+
+        Args:
+            x (torch.Tensor): Input tensor of shape (batch_size, seq_len, input_size).
+
+        Returns:
+            torch.Tensor: Output tensor of shape (batch_size, seq_len, output_size).
+        """
         # Ensure the input tensor is of the same type as the model's parameters
         x = x.to(dtype=self.fc2.weight.dtype, device=x.device)
 
@@ -53,13 +62,13 @@ class SNNLayer(nn.Module):
         spikes = []
         for _ in range(self.timesteps):
             mem1 = mem1 + self.fc1(x)
-            spike1 = (mem1 > 0.5).float()
-            mem1 = mem1 * (mem1 <= 0.5)
+            spike1 = (mem1 > 0.5).float()  # Apply spiking behavior
+            mem1 = mem1 * (mem1 <= 0.5)  # Reset membrane potential
 
             spike1 = self.dropout_layer(spike1)
             mem2 = mem2 + self.fc2(spike1)
-            spike2 = (mem2 > 0.5).float()
-            mem2 = mem2 * (mem2 <= 0.5)
+            spike2 = (mem2 > 0.5).float()  # Apply spiking behavior
+            mem2 = mem2 * (mem2 <= 0.5)  # Reset membrane potential
 
             spikes.append(spike2)
 
@@ -68,21 +77,17 @@ class SNNLayer(nn.Module):
 
         return output
 
-        # chiron/layers/snn/model.py
-
-
-# chiron/layers/snn/model.py
 
 class SNNModel(nn.Module):
     def __init__(
-            self,
-            sp_params: dict,
-            gat_params: dict,
-            htm_params: dict,
-            device: torch.device,
-            vocab: dict,
-            tokenizer: PreTrainedTokenizer,
-            snn_params: dict,
+        self,
+        sp_params: dict,
+        gat_params: dict,
+        htm_params: dict,
+        device: torch.device,
+        vocab: dict,
+        tokenizer: PreTrainedTokenizer,
+        snn_params: dict,
     ):
         super(SNNModel, self).__init__()
         self.sp_params = sp_params
@@ -115,10 +120,20 @@ class SNNModel(nn.Module):
         )
 
     def forward(
-            self,
-            input_ids: torch.Tensor,
-            adj_matrix_batches: Optional[Generator[torch.Tensor, None, None]] = None,
+        self,
+        input_ids: torch.Tensor,
+        adj_matrix_batches: Optional[Generator[torch.Tensor, None, None]] = None,
     ) -> torch.Tensor:
+        """
+        Perform the forward pass of the SNN model.
+
+        Args:
+            input_ids (torch.Tensor): Input tensor of shape (batch_size, seq_len).
+            adj_matrix_batches (Optional[Generator[torch.Tensor, None, None]]): Generator of batch adjacency matrix tensors.
+
+        Returns:
+            torch.Tensor: Output tensor of shape (batch_size, output_size).
+        """
         logger.debug(f"Input tensor shape: {input_ids.shape}")
 
         batch_size, seq_len = input_ids.size()
@@ -182,26 +197,10 @@ class SNNModel(nn.Module):
                 # Ensure the batch adjacency matrix has the correct shape
                 expected_shape = (seq_len, seq_len)
                 if batch_adj_matrix.shape != expected_shape:
-                    # If the batch adjacency matrix has a different shape, convert it to a dense tensor
-                    try:
-                        batch_adj_matrix = batch_adj_matrix.to_dense()
-                    except RuntimeError as e:
-                        raise ValueError(
-                            f"Batch adjacency matrix shape {batch_adj_matrix.shape} "
-                            f"is incompatible with the expected shape {expected_shape}"
-                        ) from e
-
-                    # Check if the dense batch adjacency matrix can fit in GPU memory
-                    dense_size = batch_adj_matrix.numel() * batch_adj_matrix.element_size()
-                    available_mem = torch.cuda.mem_get_info(self.device)[0]
-                    if dense_size > available_mem:
-                        raise ValueError(
-                            f"Dense batch adjacency matrix of size {dense_size} bytes "
-                            f"is too large to fit in GPU memory (available: {available_mem} bytes)"
-                        )
-
-                    # Slice the dense batch adjacency matrix to the expected shape
-                    batch_adj_matrix = batch_adj_matrix[:seq_len, :seq_len]
+                    # If the batch adjacency matrix has a different shape, process it in chunks
+                    batch_adj_matrix = process_adjacency_matrix_in_chunks(
+                        batch_adj_matrix, seq_len, self.device
+                    )
 
                 # Apply the GAT layer
                 gat_output = self.gat_layer(snn_output, batch_adj_matrix)
@@ -235,20 +234,19 @@ class SNNModel(nn.Module):
 
         return output
 
-
     def generate(
-            self,
-            input_conversation: list,
-            adjacency_matrix: torch.Tensor,
-            node_indices: torch.Tensor,
-            max_length: int = 100,
-            num_return_sequences: int = 1,
-            temperature: float = 0.7,
-            top_k: int = 50,
-            top_p: float = 0.9,
-            mirostat_eta: float = 0.1,
-            mirostat_tau: float = 5.0,
-            **kwargs,
+        self,
+        input_conversation: list,
+        adjacency_matrix: torch.Tensor,
+        node_indices: torch.Tensor,
+        max_length: int = 100,
+        num_return_sequences: int = 1,
+        temperature: float = 0.7,
+        top_k: int = 50,
+        top_p: float = 0.9,
+        mirostat_eta: float = 0.1,
+        mirostat_tau: float = 5.0,
+        **_,
     ) -> list:
         """
         Generate responses based on the input conversation.
@@ -305,16 +303,14 @@ class SNNModel(nn.Module):
                     dummy_adj_matrix = torch.eye(
                         input_ids.size(-1), dtype=torch.bool
                     ).to(self.device)
+
+                    # TODO: Resolve the model not using attention mask and node indices properly in some cases
                     # dummy_node_indices = torch.arange(
                     #     input_ids.size(-1), device=self.device
                     # )
-                    output = self.forward(
-                        input_ids, dummy_adj_matrix
-                    )
+                    output = self.forward(input_ids, dummy_adj_matrix)
                 else:
-                    output = self.forward(
-                        input_ids, adjacency_matrix
-                    )
+                    output = self.forward(input_ids, adjacency_matrix)
 
                 # Sample from the model's output distribution
                 output_logits = output[:, -1, :] / temperature
@@ -326,14 +322,14 @@ class SNNModel(nn.Module):
 
                 # Update Mirostat parameters
                 mirostat_s = (
-                        mirostat_eta * (output_logits.max().item() - mirostat_tau)
-                        + (1 - mirostat_eta) * mirostat_s
+                    mirostat_eta * (output_logits.max().item() - mirostat_tau)
+                    + (1 - mirostat_eta) * mirostat_s
                 )
                 mirostat_mu = mirostat_mu * torch.exp(mirostat_s)
                 temperature = max(0.1, temperature * (mirostat_tau / mirostat_mu))
 
                 # Check if the generated token is the end-of-sequence token
-                if next_token.item() == self.eos_token_id:
+                if next_token.item() == self.tokenizer.eos_token_id:
                     break
 
                 response.append(next_token.item())
@@ -415,8 +411,8 @@ class SNNModel(nn.Module):
             sorted_indices_to_remove = cumulative_probs > top_p
             # Shift the indices to the right to keep also the first token above the threshold
             sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[
-                                                ..., :-1
-                                                ].clone()
+                ..., :-1
+            ].clone()
             sorted_indices_to_remove[..., 0] = 0
 
             # Convert from sorted indices to original indices
@@ -424,3 +420,60 @@ class SNNModel(nn.Module):
             logits[indices_to_remove] = filter_value
 
         return logits
+
+
+def process_adjacency_matrix_in_chunks(
+    adj_matrix: torch.Tensor, seq_len: int, device: torch.device
+) -> torch.Tensor:
+    """
+    Process a large adjacency matrix in smaller chunks to avoid running out of GPU memory.
+
+    Args:
+        adj_matrix (torch.Tensor): The large adjacency matrix tensor.
+        seq_len (int): The sequence length.
+        device (torch.device): The device to use for tensor operations.
+
+    Returns:
+        torch.Tensor: The processed adjacency matrix tensor.
+    """
+    chunk_size = 1024  # Adjust this value based on available GPU memory
+    dense_adj_matrix = torch.zeros((seq_len, seq_len), device=device, requires_grad=False)
+
+    # Coalesce the indices of the sparse adjacency matrix
+    adj_matrix = adj_matrix.coalesce()
+
+    num_nonzero = adj_matrix._nnz()  # Use _nnz() to get the number of non-zero elements
+
+    for i in range(0, num_nonzero, chunk_size):
+        start = i
+        end = min(i + chunk_size, num_nonzero)
+        indices = adj_matrix._indices()[:, start:end]
+        values = adj_matrix._values()[start:end]
+
+        # Convert the chunk to a dense tensor
+        chunk_tensor = torch.sparse_coo_tensor(
+            indices, values, size=(seq_len, seq_len), device=device
+        ).to_dense()
+
+        # Update the dense adjacency matrix with the chunk
+        valid_row_indices = indices[0].clamp(max=seq_len - 1)
+        valid_col_indices = indices[1].clamp(max=seq_len - 1)
+
+        # Check if the indices are within the bounds of the dense adjacency matrix
+        valid_mask = (valid_row_indices < seq_len) & (valid_col_indices < seq_len)
+
+        if valid_mask.any():
+            # Reshape chunk_tensor to match the shape of valid_mask
+            chunk_tensor_reshaped = chunk_tensor.view(-1)
+
+            # Ensure chunk_tensor_reshaped and valid_mask have the same number of elements
+            chunk_tensor_reshaped = chunk_tensor_reshaped[:valid_mask.sum()]
+
+            # Create a new tensor to hold the updated values
+            updated_values = torch.zeros_like(dense_adj_matrix)
+            updated_values[valid_row_indices[valid_mask], valid_col_indices[valid_mask]] = chunk_tensor_reshaped
+
+            # Update the dense adjacency matrix with the updated values
+            dense_adj_matrix += updated_values
+
+    return dense_adj_matrix
