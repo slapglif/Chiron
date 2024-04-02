@@ -443,6 +443,7 @@ def process_adjacency_matrix_in_chunks(
     adj_matrix = adj_matrix.coalesce()
 
     num_nonzero = adj_matrix._nnz()  # Use _nnz() to get the number of non-zero elements
+    logger.debug(f"Number of non-zero elements in adjacency matrix: {num_nonzero}")
 
     for i in range(0, num_nonzero, chunk_size):
         start = i
@@ -462,18 +463,26 @@ def process_adjacency_matrix_in_chunks(
         # Check if the indices are within the bounds of the dense adjacency matrix
         valid_mask = (valid_row_indices < seq_len) & (valid_col_indices < seq_len)
 
-        if valid_mask.any():
-            # Reshape chunk_tensor to match the shape of valid_mask
-            chunk_tensor_reshaped = chunk_tensor.view(-1)
+        # Skip processing if there are no valid indices in the chunk
+        if not valid_mask.any():
+            logger.debug(f"Skipping chunk {start}-{end} due to no valid indices")
+            continue
 
-            # Ensure chunk_tensor_reshaped and valid_mask have the same number of elements
-            chunk_tensor_reshaped = chunk_tensor_reshaped[:valid_mask.sum()]
+        # Apply the valid mask to the row and column indices
+        valid_row_indices = valid_row_indices[valid_mask]
+        valid_col_indices = valid_col_indices[valid_mask]
 
-            # Create a new tensor to hold the updated values
-            updated_values = torch.zeros_like(dense_adj_matrix)
-            updated_values[valid_row_indices[valid_mask], valid_col_indices[valid_mask]] = chunk_tensor_reshaped
+        # Reshape chunk_tensor to match the shape of valid_mask
+        chunk_tensor_reshaped = chunk_tensor.view(-1)[valid_mask]
 
-            # Update the dense adjacency matrix with the updated values
-            dense_adj_matrix += updated_values
+        # Ensure chunk_tensor_reshaped has the same number of elements as valid indices
+        if chunk_tensor_reshaped.shape[0] != valid_row_indices.shape[0]:
+            logger.error("Shape mismatch between chunk_tensor_reshaped and valid indices")
+            logger.error(f"chunk_tensor_reshaped shape: {chunk_tensor_reshaped.shape}")
+            logger.error(f"valid_row_indices shape: {valid_row_indices.shape}")
+            raise ValueError("Shape mismatch between chunk_tensor_reshaped and valid indices")
+
+        # Update the dense adjacency matrix using the reshaped chunk tensor
+        dense_adj_matrix[valid_row_indices, valid_col_indices] += chunk_tensor_reshaped
 
     return dense_adj_matrix
