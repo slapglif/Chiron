@@ -172,7 +172,8 @@ def train(
             with torch.cuda.amp.autocast():
                 # Forward pass
                 outputs = model(
-                    input_ids, attention_mask, adjacency_matrix_sparse, node_indices
+                    input_ids,
+                    adjacency_matrix_sparse,
                 )
 
                 # Reshape outputs to match the shape of class_indices

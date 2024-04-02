@@ -1,4 +1,5 @@
 # chiron/layers/snn/model.py
+
 from typing import Optional, Generator
 
 import torch
@@ -16,12 +17,12 @@ class SNNLayer(nn.Module):
     """
 
     def __init__(
-        self,
-        input_size: int,
-        hidden_size: int,
-        output_size: int,
-        timesteps: int,
-        dropout: float = 0.0,
+            self,
+            input_size: int,
+            hidden_size: int,
+            output_size: int,
+            timesteps: int,
+            dropout: float = 0.0,
     ):
         super(SNNLayer, self).__init__()
         self.input_size = input_size
@@ -67,21 +68,11 @@ class SNNLayer(nn.Module):
 
         return output
 
+        # chiron/layers/snn/model.py
+
+# chiron/layers/snn/model.py
 
 class SNNModel(nn.Module):
-    """
-    Spiking Neural Network (SNN) model.
-
-    Args:
-        sp_params (dict): Parameters for the spatial pooling layer.
-        gat_params (dict): Parameters for the Graph Attention layer.
-        htm_params (dict): Parameters for the Hierarchical Temporal Memory layer.
-        device (torch.device): The device to run the model on.
-        vocab (dict): The vocabulary mapping for token to index.
-        tokenizer (PreTrainedTokenizer): The tokenizer for processing text.
-        snn_params (dict): Parameters for the SNN layer.
-    """
-
     def __init__(
             self,
             sp_params: dict,
@@ -100,14 +91,15 @@ class SNNModel(nn.Module):
         self.vocab = vocab
         self.tokenizer = tokenizer
         self.output_size = sp_params["sdr_dimensions"]
-        self.snn_params = snn_params  # Store the snn_params dictionary as an attribute
+        self.snn_params = snn_params
 
-        self.snn_layer = None  # Will be dynamically initialized based on input size
+        self.snn_layer = None
         self.gat_layer = GraphAttentionLayer(
-            in_features=gat_params["in_features"],
-            out_features=gat_params["out_features"],
-            num_heads=gat_params["num_heads"],
-            alpha=gat_params["alpha"],
+            in_features=self.snn_params["output_size"],
+            out_features=self.gat_params["out_features"],
+            num_heads=self.gat_params["num_heads"],
+            alpha=self.gat_params["alpha"],
+            concat=self.gat_params["concat"],
         ).to(device)
 
         self.htm_layer = HTMModel(
@@ -124,9 +116,7 @@ class SNNModel(nn.Module):
     def forward(
             self,
             input_ids: torch.Tensor,
-            attention_mask: Optional[torch.Tensor] = None,
             adj_matrix_batches: Optional[Generator[torch.Tensor, None, None]] = None,
-            node_indices: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         logger.debug(f"Input tensor shape: {input_ids.shape}")
 
@@ -154,18 +144,25 @@ class SNNModel(nn.Module):
         logger.debug(f"SNN output shape: {snn_output.shape}")
 
         # Ensure the SNN output tensor has the expected shape
-
-        expected_snn_output_shape = (batch_size, self.snn_params["timesteps"], seq_len, self.snn_params["output_size"])
+        expected_snn_output_shape = (
+            batch_size,
+            self.snn_params["timesteps"],
+            seq_len,
+            self.snn_params["output_size"],
+        )
         if snn_output.shape != expected_snn_output_shape:
             raise ValueError(
-                f"SNN output shape {snn_output.shape} does not match the expected shape {expected_snn_output_shape}"
+                f"SNN output shape {snn_output.shape} "
+                f"does not match the expected shape {expected_snn_output_shape}"
             )
 
-        # Reshape the SNN output to (batch_size, seq_len, -1)
-        snn_output = snn_output.view(batch_size, seq_len, -1)
+        # Reshape the SNN output to (batch_size, seq_len, snn_output_size)
+        snn_output = snn_output[:, -1, :, :]  # Take the last timestep output
 
         # Initialize an empty tensor to store the accumulated GAT output
-        accumulated_gat_output = torch.zeros(batch_size, seq_len, self.gat_params["out_features"], device=self.device)
+        accumulated_gat_output = torch.zeros(
+            batch_size, seq_len, self.gat_params["out_features"], device=self.device
+        )
 
         # Process each batch adjacency matrix tensor
         if adj_matrix_batches is None:
@@ -175,9 +172,38 @@ class SNNModel(nn.Module):
             accumulated_gat_output += gat_output
         else:
             for batch_adj_matrix in adj_matrix_batches:
+                # Ensure the batch adjacency matrix has the correct number of dimensions
+                if batch_adj_matrix.ndim != 2:
+                    raise ValueError(
+                        f"Batch adjacency matrix must be a 2D tensor, but got {batch_adj_matrix.ndim}D tensor"
+                    )
+
+                # Ensure the batch adjacency matrix has the correct shape
+                expected_shape = (seq_len, seq_len)
+                if batch_adj_matrix.shape != expected_shape:
+                    # If the batch adjacency matrix has a different shape, try to resize it
+                    try:
+                        batch_adj_matrix = batch_adj_matrix.resize_(expected_shape)
+                    except RuntimeError:
+                        raise ValueError(
+                            f"Batch adjacency matrix shape {batch_adj_matrix.shape} "
+                            f"does not match the expected shape {expected_shape} and cannot be resized"
+                        )
+
                 # Apply the GAT layer
                 gat_output = self.gat_layer(snn_output, batch_adj_matrix)
                 logger.debug(f"GAT output shape: {gat_output.shape}")
+
+                # Ensure the GAT output tensor has the expected shape
+                expected_gat_output_shape = (
+                    batch_size,
+                    seq_len,
+                    self.gat_params["out_features"],
+                )
+                if gat_output.shape != expected_gat_output_shape:
+                    raise ValueError(
+                        f"GAT output shape {gat_output.shape} does not match the expected shape {expected_gat_output_shape}"
+                    )
 
                 # Accumulate the GAT output
                 accumulated_gat_output += gat_output
@@ -195,6 +221,7 @@ class SNNModel(nn.Module):
         logger.debug(f"Final output shape: {output.shape}")
 
         return output
+
 
     def generate(
             self,
@@ -265,15 +292,15 @@ class SNNModel(nn.Module):
                     dummy_adj_matrix = torch.eye(
                         input_ids.size(-1), dtype=torch.bool
                     ).to(self.device)
-                    dummy_node_indices = torch.arange(
-                        input_ids.size(-1), device=self.device
-                    )
+                    # dummy_node_indices = torch.arange(
+                    #     input_ids.size(-1), device=self.device
+                    # )
                     output = self.forward(
-                        input_ids, attention_mask, dummy_adj_matrix, dummy_node_indices
+                        input_ids, dummy_adj_matrix
                     )
                 else:
                     output = self.forward(
-                        input_ids, attention_mask, adjacency_matrix, node_indices
+                        input_ids, adjacency_matrix
                     )
 
                 # Sample from the model's output distribution

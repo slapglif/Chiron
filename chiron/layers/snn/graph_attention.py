@@ -1,7 +1,3 @@
-# chiron/layers/snn/graph_attention.py
-
-from typing import Optional
-
 import torch
 import torch.nn as nn
 from loguru import logger
@@ -10,34 +6,16 @@ from loguru import logger
 class GraphAttentionLayer(nn.Module):
     """
     Graph Attention Layer implementation.
-
-    This layer applies a multi-head attention mechanism to the input tensor,
-    allowing nodes in the graph to attend to each other based on their feature
-    representations and the graph structure.
-
-    Args:
-        in_features (int): Number of input features for each node.
-        out_features (int): Number of output features for each node.
-        num_heads (int): Number of attention heads. Default is 1.
-        dropout (float): Dropout probability. Default is 0.0.
-        alpha (float): Negative slope for the LeakyReLU activation function. Default is 0.2.
-        concat (bool): If True, concatenate the output of all attention heads. Otherwise, average them. Default is True.
-
-    Attributes:
-        W (nn.Parameter): Linear transformation weight matrix for computing attention scores.
-        a (nn.Parameter): Learnable attention mechanism coefficient.
-        leakyrelu (nn.LeakyReLU): LeakyReLU activation function.
-        dropout (nn.Dropout): Dropout layer.
     """
 
     def __init__(
-            self,
-            in_features: int,
-            out_features: int,
-            num_heads: int = 1,
-            dropout: float = 0.0,
-            alpha: float = 0.2,
-            concat: bool = True,
+        self,
+        in_features: int,
+        out_features: int,
+        num_heads: int = 1,
+        dropout: float = 0.0,
+        alpha: float = 0.2,
+        concat: bool = True,
     ):
         super(GraphAttentionLayer, self).__init__()
         self.in_features = in_features
@@ -91,9 +69,9 @@ class GraphAttentionLayer(nn.Module):
         return attn_scores
 
     def forward(
-            self,
-            input_tensor: torch.Tensor,
-            adj_matrix: Optional[torch.sparse.Tensor] = None,
+        self,
+        input_tensor: torch.Tensor,
+        adj_matrix: torch.sparse.Tensor = None,
     ) -> torch.Tensor:
         """
         Compute the output features for the input tensor.
@@ -103,15 +81,12 @@ class GraphAttentionLayer(nn.Module):
             adj_matrix (torch.sparse.Tensor, optional): Adjacency matrix tensor of shape (seq_len, seq_len). Default is None.
 
         Returns:
-            torch.Tensor: Output tensor of shape (batch_size, seq_len, num_heads * out_features) or (batch_size, seq_len, out_features).
+            torch.Tensor: Output tensor of shape (batch_size, seq_len, num_heads * out_features_per_head) or (batch_size, seq_len, out_features).
         """
-        batch_size, seq_len, _ = input_tensor.size()
+        batch_size, seq_len, num_features = input_tensor.size()
 
         # Compute attention scores
         attn_scores = self._compute_attention_scores(input_tensor)
-
-        logger.debug(f"input_tensor shape: {input_tensor.size()}")
-        logger.debug(f"attn_scores shape: {attn_scores.shape}")
 
         # Apply the adjacency matrix mask to the attention scores (if provided)
         if adj_matrix is not None:
@@ -144,8 +119,6 @@ class GraphAttentionLayer(nn.Module):
                 )
 
             edge_indices = adj_matrix._indices()
-            logger.debug(f"edge_indices: {edge_indices}")
-            logger.debug(f"edge_indices shape: {edge_indices.shape}")
 
             if edge_indices.shape[-1] == 0:
                 logger.warning(
@@ -153,36 +126,17 @@ class GraphAttentionLayer(nn.Module):
                 )
                 mask = torch.zeros_like(attn_scores, dtype=torch.bool)
             else:
-                edge_indices_batch = edge_indices.unsqueeze(0).expand(
-                    batch_size, -1, -1
-                )
-                edge_indices_head = edge_indices_batch.unsqueeze(1).expand(
-                    -1, self.num_heads, -1, -1
-                )
-
-                logger.debug(f"edge_indices_head: {edge_indices_head}")
-                logger.debug(f"edge_indices_head shape: {edge_indices_head.shape}")
-
                 # Create the mask tensor with the correct shape
                 mask_shape = (
                     batch_size,
                     self.num_heads,
-                    attn_scores.size(2),
-                    edge_indices_head.size(-1),
+                    seq_len,
+                    seq_len,
                 )
                 mask = torch.zeros(
                     mask_shape, dtype=torch.bool, device=attn_scores.device
                 )
-                mask.scatter_(3, edge_indices_head, True)
-
-                logger.debug(f"mask shape after scatter: {mask.shape}")
-
-                # Check if the mask shape matches the attn_scores shape along the desired dimensions
-                expected_mask_shape = mask.shape
-                if attn_scores.shape != expected_mask_shape:
-                    raise ValueError(
-                        f"Attention scores shape {attn_scores.shape} does not match the expected mask shape {expected_mask_shape}"
-                    )
+                mask[edge_indices[0], :, edge_indices[1], edge_indices[1]] = True
 
             # Apply the mask to the attention scores
             attn_scores = attn_scores.masked_fill(~mask, float("-inf"))
@@ -197,12 +151,11 @@ class GraphAttentionLayer(nn.Module):
         # Apply attention probabilities to the input tensor
         attn_output = torch.einsum("bhij,bjhk->bihk", attn_probs, input_tensor)
 
-        # Reshape the attention output
         if self.concat:
-            attn_output = attn_output.reshape(
-                batch_size, seq_len, self.num_heads * attn_output.size(-1)
-            )
+            # Reshape the attention output to (batch_size, seq_len, num_heads * out_features_per_head)
+            attn_output = attn_output.reshape(batch_size, seq_len, -1)
         else:
+            # Average the attention output across the attention heads
             attn_output = attn_output.mean(dim=1)
 
         return attn_output
