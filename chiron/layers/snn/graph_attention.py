@@ -1,6 +1,6 @@
 # chiron/layers/snn/graph_attention.py
 
-from typing import Optional, Tuple
+from typing import Optional
 
 import torch
 import torch.nn as nn
@@ -31,13 +31,13 @@ class GraphAttentionLayer(nn.Module):
     """
 
     def __init__(
-        self,
-        in_features: int,
-        out_features: int,
-        num_heads: int = 1,
-        dropout: float = 0.0,
-        alpha: float = 0.2,
-        concat: bool = True,
+            self,
+            in_features: int,
+            out_features: int,
+            num_heads: int = 1,
+            dropout: float = 0.0,
+            alpha: float = 0.2,
+            concat: bool = True,
     ):
         super(GraphAttentionLayer, self).__init__()
         self.in_features = in_features
@@ -77,23 +77,23 @@ class GraphAttentionLayer(nn.Module):
         Returns:
             torch.Tensor: Attention scores of shape (batch_size, num_heads, seq_len, seq_len).
         """
-        batch_size, seq_len, _ = input_tensor.size()
+        batch_size, seq_len, num_features = input_tensor.size()
 
-        # Reshape the input tensor to (batch_size, num_heads, seq_len, out_features_per_head)
-        input_tensor = torch.einsum("bij,hjk->bihk", input_tensor, self.W)
+        # Reshape the input tensor to (batch_size, seq_len, num_heads, out_features_per_head)
+        input_tensor = input_tensor.view(batch_size, seq_len, self.num_heads, -1)
 
         # Compute the attention scores using the attention mechanism coefficient
         attn_scores = torch.einsum(
-            "bihk,bijl->bhij", input_tensor, input_tensor.repeat(1, 1, seq_len, 1)
+            "bihk,bjhk->bhij", input_tensor, input_tensor
         )
         attn_scores = self.leakyrelu(attn_scores)
 
         return attn_scores
 
     def forward(
-        self,
-        input_tensor: torch.Tensor,
-        adj_matrix: Optional[torch.sparse.Tensor] = None,
+            self,
+            input_tensor: torch.Tensor,
+            adj_matrix: Optional[torch.sparse.Tensor] = None,
     ) -> torch.Tensor:
         """
         Compute the output features for the input tensor.

@@ -37,42 +37,36 @@ class SNNLayer(nn.Module):
         # Ensure the input tensor is of the same type as the model's parameters
         x = x.to(dtype=self.fc2.weight.dtype, device=x.device)
 
-        batch_size = x.size(0)
-        seq_len = x.size(1)
+        batch_size, seq_len, _ = x.shape
 
-        # Reshape the input tensor to (batch_size * seq_len, input_size)
-        x = x.view(batch_size * seq_len, -1)
+        # Reshape the input tensor to (batch_size, seq_len, input_size)
+        x = x.view(batch_size, seq_len, self.input_size)
 
         mem1 = torch.zeros(
-            batch_size * seq_len, self.hidden_size, device=x.device, dtype=x.dtype
+            batch_size, seq_len, self.hidden_size, device=x.device, dtype=x.dtype
         )
         mem2 = torch.zeros(
-            batch_size * seq_len, self.output_size, device=x.device, dtype=x.dtype
+            batch_size, seq_len, self.output_size, device=x.device, dtype=x.dtype
         )
 
         spikes = []
         for _ in range(self.timesteps):
-            mem1 += self.fc1(x)
+            mem1 = mem1 + self.fc1(x)
             spike1 = (mem1 > 0.5).float()
-            mem1 *= mem1 <= 0.5
+            mem1 = mem1 * (mem1 <= 0.5)
 
             spike1 = self.dropout_layer(spike1)
-            mem2 += self.fc2(spike1)
+            mem2 = mem2 + self.fc2(spike1)
             spike2 = (mem2 > 0.5).float()
-            mem2 *= mem2 <= 0.5
+            mem2 = mem2 * (mem2 <= 0.5)
 
             spikes.append(spike2)
 
         # Stack the spikes along the timestep dimension
-        output = torch.stack(spikes, dim=0)
-
-        # Reshape the output tensor to (timesteps, batch_size, seq_len, output_size)
-        output = output.view(self.timesteps, batch_size, seq_len, self.output_size)
-
-        # Permute the dimensions to (batch_size, timesteps, seq_len, output_size)
-        output = output.permute(1, 0, 2, 3)
+        output = torch.stack(spikes, dim=1)
 
         return output
+
 
 class SNNModel(nn.Module):
     """
@@ -141,6 +135,9 @@ class SNNModel(nn.Module):
         # Move the input tensor to the specified device
         input_ids = input_ids.to(self.device)
 
+        # Reshape the input tensor to (batch_size, seq_len, input_size)
+        input_ids = input_ids.view(batch_size, seq_len, -1)
+
         # Dynamically initialize the SNNLayer based on the input size
         if self.snn_layer is None:
             input_size = input_ids.size(-1)
@@ -155,7 +152,9 @@ class SNNModel(nn.Module):
         # Apply the SNN layer
         snn_output = self.snn_layer(input_ids)
         logger.debug(f"SNN output shape: {snn_output.shape}")
+
         # Ensure the SNN output tensor has the expected shape
+
         expected_snn_output_shape = (batch_size, self.snn_params["timesteps"], seq_len, self.snn_params["output_size"])
         if snn_output.shape != expected_snn_output_shape:
             raise ValueError(
