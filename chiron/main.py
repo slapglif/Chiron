@@ -54,7 +54,7 @@ def load_dataset(config: Config) -> List[List[Dict[str, Any]]]:
 
 
 def build_vocab(
-        preprocessed_conversations: List[str], max_vocab_size: int
+    preprocessed_conversations: List[str], max_vocab_size: int
 ) -> Dict[str, int]:
     """
     Build a vocabulary from the preprocessed conversations.
@@ -72,7 +72,7 @@ def build_vocab(
     )
 
     for idx, (token, count) in enumerate(
-            token_counts.most_common(max_vocab_size - 2), start=2
+        token_counts.most_common(max_vocab_size - 2), start=2
     ):
         vocab[token] = idx
 
@@ -80,12 +80,12 @@ def build_vocab(
 
 
 def lsh_cosine_similarity(
-        sdr_embeddings: torch.Tensor,
-        threshold: float = 0.5,
-        num_projections: int = 128,
-        seed: int = 42,
-        chunk_size: int = 1000,  # Number of embeddings to process at a time
-        batch_size: int = 10000,  # Number of rows to process in each batch
+    sdr_embeddings: torch.Tensor,
+    threshold: float = 0.5,
+    num_projections: int = 128,
+    seed: int = 42,
+    chunk_size: int = 1000,  # Number of embeddings to process at a time
+    batch_size: int = 10000,  # Number of rows to process in each batch
 ) -> torch.Tensor:
     num_embeddings = sdr_embeddings.size(0)
     device = sdr_embeddings.device
@@ -138,7 +138,7 @@ def lsh_cosine_similarity(
                     hash_codes[k] != hash_codes[start:end], axis=1
                 )
                 estimated_cosine_similarity_chunk = 1 - hamming_distances_chunk / (
-                        num_projections * 2
+                    num_projections * 2
                 )
 
                 # Threshold the estimated cosine similarity and store the indices and values
@@ -175,10 +175,10 @@ def lsh_cosine_similarity(
 
 
 def create_adjacency_matrix_lsh(
-        sdr_embeddings: torch.Tensor,
-        threshold: float = 0.5,
-        num_projections: int = 128,
-        seed: int = 42,
+    sdr_embeddings: torch.Tensor,
+    threshold: float = 0.5,
+    num_projections: int = 128,
+    seed: int = 42,
 ) -> torch.sparse.Tensor:
     adjacency_matrix_sparse = lsh_cosine_similarity(
         sdr_embeddings, threshold, num_projections, seed

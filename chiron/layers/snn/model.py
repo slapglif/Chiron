@@ -16,43 +16,38 @@ class SNNLayer(nn.Module):
     """
 
     def __init__(
-            self,
-            hidden_size: int,
-            output_size: int,
-            timesteps: int,
-            num_nodes: int,
-            dropout: float = 0.0,
+        self,
+        input_size: int,
+        hidden_size: int,
+        output_size: int,
+        timesteps: int,
+        dropout: float = 0.0,
     ):
         super(SNNLayer, self).__init__()
+        self.input_size = input_size
         self.hidden_size = hidden_size
         self.output_size = output_size
         self.timesteps = timesteps
-        self.num_nodes = num_nodes
         self.dropout = dropout
-        self.fc1 = None  # will be dynamically defined based on input size
+        self.fc1 = nn.Linear(input_size, hidden_size)
         self.fc2 = nn.Linear(hidden_size, output_size)
         self.dropout_layer = nn.Dropout(dropout)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if self.fc1 is None:
-            input_size = x.size(-1)
-            self.fc1 = nn.Linear(input_size, self.hidden_size).to(x.device)
-
         # Ensure the input tensor is of the same type as the model's parameters
         x = x.to(dtype=self.fc2.weight.dtype, device=x.device)
 
-        if (
-                x.dim() == 2
-        ):  # If input is 2D (batch_size, feature_size), add a sequence dimension
-            x = x.unsqueeze(1)  # Reshape to (batch_size, 1, feature_size)
+        batch_size = x.size(0)
+        seq_len = x.size(1)
 
-        batch_size, seq_len, _ = x.shape
+        # Reshape the input tensor to (batch_size * seq_len, input_size)
+        x = x.view(batch_size * seq_len, -1)
 
         mem1 = torch.zeros(
-            batch_size, seq_len, self.hidden_size, device=x.device, dtype=x.dtype
+            batch_size * seq_len, self.hidden_size, device=x.device, dtype=x.dtype
         )
         mem2 = torch.zeros(
-            batch_size, seq_len, self.output_size, device=x.device, dtype=x.dtype
+            batch_size * seq_len, self.output_size, device=x.device, dtype=x.dtype
         )
 
         spikes = []
@@ -68,14 +63,21 @@ class SNNLayer(nn.Module):
 
             spikes.append(spike2)
 
-        output = torch.stack(spikes, dim=1).mean(dim=1)
+        # Stack the spikes along the timestep dimension
+        output = torch.stack(spikes, dim=0)
+
+        # Reshape the output tensor to (timesteps, batch_size, seq_len, output_size)
+        output = output.view(self.timesteps, batch_size, seq_len, self.output_size)
+
+        # Permute the dimensions to (batch_size, timesteps, seq_len, output_size)
+        output = output.permute(1, 0, 2, 3)
 
         return output
-
 
 class SNNModel(nn.Module):
     """
     Spiking Neural Network (SNN) model.
+
     Args:
         sp_params (dict): Parameters for the spatial pooling layer.
         gat_params (dict): Parameters for the Graph Attention layer.
@@ -104,15 +106,9 @@ class SNNModel(nn.Module):
         self.vocab = vocab
         self.tokenizer = tokenizer
         self.output_size = sp_params["sdr_dimensions"]
+        self.snn_params = snn_params  # Store the snn_params dictionary as an attribute
 
-        self.snn_layer = SNNLayer(
-            hidden_size=snn_params["hidden_size"],
-            output_size=snn_params["output_size"],
-            timesteps=snn_params["timesteps"],
-            num_nodes=self.output_size,
-            dropout=snn_params.get("dropout", 0.0),
-        ).to(device)
-
+        self.snn_layer = None  # Will be dynamically initialized based on input size
         self.gat_layer = GraphAttentionLayer(
             in_features=gat_params["in_features"],
             out_features=gat_params["out_features"],
@@ -120,7 +116,6 @@ class SNNModel(nn.Module):
             alpha=gat_params["alpha"],
         ).to(device)
 
-        # Ensure the output size of SNNLayer matches the expected input size of HTMModel
         self.htm_layer = HTMModel(
             sdr_dimensions=self.output_size, device=device, **htm_params
         ).to(device)
@@ -135,55 +130,61 @@ class SNNModel(nn.Module):
     def forward(
             self,
             input_ids: torch.Tensor,
-            attention_mask: torch.Tensor,
+            attention_mask: Optional[torch.Tensor] = None,
             adj_matrix_batches: Optional[Generator[torch.Tensor, None, None]] = None,
             node_indices: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """
-        Perform the forward pass of the SNN model.
-        Args:
-            input_ids (torch.Tensor): The input token IDs tensor of shape (batch_size, seq_len) or (batch_size,).
-            attention_mask (torch.Tensor): The attention mask tensor of shape (batch_size, seq_len) or (batch_size,).
-                This parameter is not used in the current implementation, but it is kept for future compatibility.
-            adj_matrix_batches (Generator[torch.Tensor, None, None], optional): The generator of batch adjacency matrix tensors.
-                Each batch tensor has shape (num_embeddings, num_embeddings).
-            node_indices (torch.Tensor, optional): The node indices tensor.
-                This parameter is not used in the current implementation, but it is kept for future compatibility.
-        Returns:
-            torch.Tensor: The output tensor of shape (batch_size, output_size).
-        """
         logger.debug(f"Input tensor shape: {input_ids.shape}")
-        logger.debug(f"Attention mask shape: {attention_mask.shape}")
-        logger.debug(f"Node indices shape: {node_indices.shape}")
-
-        # Add an extra dimension if input_ids is 1D
-        if input_ids.ndim == 1:
-            input_ids = input_ids.unsqueeze(0)
 
         batch_size, seq_len = input_ids.size()
 
-        # Move the input tensors to the specified device
+        # Move the input tensor to the specified device
         input_ids = input_ids.to(self.device)
-        attention_mask = attention_mask.to(self.device)
+
+        # Dynamically initialize the SNNLayer based on the input size
+        if self.snn_layer is None:
+            input_size = input_ids.size(-1)
+            self.snn_layer = SNNLayer(
+                input_size=input_size,
+                hidden_size=self.snn_params["hidden_size"],
+                output_size=self.snn_params["output_size"],
+                timesteps=self.snn_params["timesteps"],
+                dropout=self.snn_params.get("dropout", 0.0),
+            ).to(self.device)
 
         # Apply the SNN layer
         snn_output = self.snn_layer(input_ids)
         logger.debug(f"SNN output shape: {snn_output.shape}")
+        # Ensure the SNN output tensor has the expected shape
+        expected_snn_output_shape = (batch_size, self.snn_params["timesteps"], seq_len, self.snn_params["output_size"])
+        if snn_output.shape != expected_snn_output_shape:
+            raise ValueError(
+                f"SNN output shape {snn_output.shape} does not match the expected shape {expected_snn_output_shape}"
+            )
+
+        # Reshape the SNN output to (batch_size, seq_len, -1)
+        snn_output = snn_output.view(batch_size, seq_len, -1)
 
         # Initialize an empty tensor to store the accumulated GAT output
-        accumulated_gat_output = torch.zeros_like(snn_output)
+        accumulated_gat_output = torch.zeros(batch_size, seq_len, self.gat_params["out_features"], device=self.device)
 
         # Process each batch adjacency matrix tensor
-        for batch_adj_matrix in adj_matrix_batches:
-            # Apply the GAT layer
-            gat_output = self.gat_layer(snn_output, batch_adj_matrix)
-            logger.debug(f"GAT output shape: {gat_output.shape}")
-
-            # Accumulate the GAT output
+        if adj_matrix_batches is None:
+            # If no adjacency matrix batches are provided, create a dummy identity matrix
+            dummy_adj_matrix = torch.eye(seq_len, device=self.device)
+            gat_output = self.gat_layer(snn_output, dummy_adj_matrix)
             accumulated_gat_output += gat_output
+        else:
+            for batch_adj_matrix in adj_matrix_batches:
+                # Apply the GAT layer
+                gat_output = self.gat_layer(snn_output, batch_adj_matrix)
+                logger.debug(f"GAT output shape: {gat_output.shape}")
+
+                # Accumulate the GAT output
+                accumulated_gat_output += gat_output
 
         # Compute the average GAT output
-        avg_gat_output = accumulated_gat_output / len(adj_matrix_batches)
+        avg_gat_output = accumulated_gat_output / (len(adj_matrix_batches) or 1)
         logger.debug(f"Average GAT output shape: {avg_gat_output.shape}")
 
         # Apply the HTM layer
@@ -347,6 +348,18 @@ class SNNModel(nn.Module):
 
     @staticmethod
     def _top_k_top_p_filtering(logits, top_k=0, top_p=1.0, filter_value=-float("Inf")):
+        """
+        Filter the logits using top-k and/or top-p filtering.
+
+        Args:
+            logits (torch.Tensor): The logits tensor.
+            top_k (int, optional): The number of top-k tokens to keep. Default is 0.
+            top_p (float, optional): The cumulative probability threshold for top-p filtering. Default is 1.0.
+            filter_value (float, optional): The value to replace the filtered logits with. Default is -infinity.
+
+        Returns:
+            torch.Tensor: The filtered logits tensor.
+        """
         # Filter the logits using top-k and/or top-p filtering
         top_k = min(top_k, logits.size(-1))
         if top_k > 0:
