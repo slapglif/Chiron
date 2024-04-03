@@ -1,6 +1,6 @@
 # chiron/layers/snn/model.py
-
-from typing import Optional, Generator
+from contextlib import contextmanager
+from typing import Optional, Generator, Union
 
 import torch
 import torch.nn as nn
@@ -120,16 +120,16 @@ class SNNModel(nn.Module):
         )
 
     def forward(
-        self,
-        input_ids: torch.Tensor,
-        adj_matrix_batches: Optional[Generator[torch.Tensor, None, None]] = None,
+            self,
+            input_ids: torch.Tensor,
+            adjacency_matrix_batches: Optional[Generator[torch.Tensor, None, None]] = None,
     ) -> torch.Tensor:
         """
         Perform the forward pass of the SNN model.
 
         Args:
             input_ids (torch.Tensor): Input tensor of shape (batch_size, seq_len).
-            adj_matrix_batches (Optional[Generator[torch.Tensor, None, None]]): Generator of batch adjacency matrix tensors.
+            adjacency_matrix_batches (Optional[Generator[torch.Tensor, None, None]]): Generator of batch adjacency matrix tensors.
 
         Returns:
             torch.Tensor: Output tensor of shape (batch_size, output_size).
@@ -181,13 +181,13 @@ class SNNModel(nn.Module):
         )
 
         # Process each batch adjacency matrix tensor
-        if adj_matrix_batches is None:
+        if adjacency_matrix_batches is None:
             # If no adjacency matrix batches are provided, create a dummy identity matrix
             dummy_adj_matrix = torch.eye(seq_len, device=self.device)
             gat_output = self.gat_layer(snn_output, dummy_adj_matrix)
             accumulated_gat_output += gat_output
         else:
-            for batch_adj_matrix in adj_matrix_batches:
+            for batch_adj_matrix in adjacency_matrix_batches:
                 # Ensure the batch adjacency matrix has the correct number of dimensions
                 if batch_adj_matrix.ndim != 2:
                     raise ValueError(
@@ -198,8 +198,8 @@ class SNNModel(nn.Module):
                 expected_shape = (seq_len, seq_len)
                 if batch_adj_matrix.shape != expected_shape:
                     # If the batch adjacency matrix has a different shape, process it in chunks
-                    batch_adj_matrix = process_adjacency_matrix_in_chunks(
-                        batch_adj_matrix, seq_len, self.device
+                    batch_adj_matrix = self.process_adjacency_matrix_in_chunks(
+                        batch_adj_matrix, seq_len
                     )
 
                 # Apply the GAT layer
@@ -221,7 +221,7 @@ class SNNModel(nn.Module):
                 accumulated_gat_output += gat_output
 
         # Compute the average GAT output
-        avg_gat_output = accumulated_gat_output / (len(adj_matrix_batches) or 1)
+        avg_gat_output = accumulated_gat_output / (len(adjacency_matrix_batches) or 1)
         logger.debug(f"Average GAT output shape: {avg_gat_output.shape}")
 
         # Apply the HTM layer
@@ -233,6 +233,87 @@ class SNNModel(nn.Module):
         logger.debug(f"Final output shape: {output.shape}")
 
         return output
+
+    def process_adjacency_matrix_in_chunks(
+            self,
+            batch_adj_matrix: Union[torch.Tensor, torch.sparse.Tensor],
+            seq_len: int,
+            chunk_size: int = 1024,
+    ) -> torch.Tensor:
+        """
+        Process a batch of adjacency matrices or a single adjacency matrix in chunks to avoid memory issues.
+
+        Args:
+            batch_adj_matrix (torch.Tensor or torch.sparse.Tensor): Batch of adjacency matrices
+                with shape (batch_size, seq_len, seq_len) or a single adjacency matrix
+                with shape (seq_len, seq_len).
+            seq_len (int): The sequence length.
+            chunk_size (int): Number of adjacency matrix elements to process
+                in each chunk (default: 1024).
+
+        Returns:
+            torch.Tensor: Processed adjacency matrices or a single adjacency matrix
+                with the same shape as the input.
+        """
+        if isinstance(batch_adj_matrix, torch.sparse.Tensor):
+            # If the input is a sparse tensor, process it directly without converting to dense
+            batch_size = batch_adj_matrix.size(0)
+            output = torch.zeros((batch_size, seq_len, seq_len), device=self.device)
+
+            # Process the sparse tensor in chunks
+            for i in range(batch_size):
+                adj_matrix = batch_adj_matrix[i]
+
+                for start_row in range(0, seq_len, chunk_size):
+                    end_row = min(start_row + chunk_size, seq_len)
+
+                    for start_col in range(0, seq_len, chunk_size):
+                        end_col = min(start_col + chunk_size, seq_len)
+
+                        # Get the current chunk of the sparse tensor
+                        adj_matrix_chunk = adj_matrix[start_row:end_row, start_col:end_col]
+
+                        # Normalize the current chunk by row using L1 normalization
+                        adj_matrix_chunk = torch.sparse.softmax(adj_matrix_chunk, dim=-1)
+
+                        # Convert the sparse chunk to dense and update the corresponding part of the output tensor
+                        output[i, start_row:end_row, start_col:end_col] = adj_matrix_chunk.to_dense()
+
+        else:
+            # If the input is a dense tensor
+            if batch_adj_matrix.dim() == 2:
+                # If the input is a 2D tensor, add a batch dimension
+                batch_adj_matrix = batch_adj_matrix.unsqueeze(0)
+
+            batch_size, seq_len, _ = batch_adj_matrix.shape
+
+            # Initialize output tensor
+            output = torch.empty((batch_size, seq_len, seq_len), device=self.device)
+
+            # Process adjacency matrix in chunks
+            for start_row in range(0, seq_len, chunk_size):
+                end_row = min(start_row + chunk_size, seq_len)
+
+                for start_col in range(0, seq_len, chunk_size):
+                    end_col = min(start_col + chunk_size, seq_len)
+
+                    # Get the current chunk
+                    adj_matrix_chunk = batch_adj_matrix[:, start_row:end_row, start_col:end_col]
+
+                    # Normalize the current chunk by row using L1 normalization
+                    adj_matrix_chunk = torch.nn.functional.normalize(
+                        adj_matrix_chunk, p=1, dim=-1
+                    )
+
+                    # Update the corresponding part of the output tensor with the processed chunk
+                    output[:, start_row:end_row, start_col:end_col] = adj_matrix_chunk
+
+        # Remove the batch dimension if the input was a single adjacency matrix
+        if output.size(0) == 1:
+            output = output.squeeze(0)
+
+        return output
+
 
     def generate(
         self,
@@ -421,68 +502,16 @@ class SNNModel(nn.Module):
 
         return logits
 
+    @contextmanager
+    def torch_no_grad_and_inference_mode(self, device: torch.device):
+        """
+        Context manager to temporarily set PyTorch to no_grad and inference mode.
 
-def process_adjacency_matrix_in_chunks(
-    adj_matrix: torch.Tensor, seq_len: int, device: torch.device
-) -> torch.Tensor:
-    """
-    Process a large adjacency matrix in smaller chunks to avoid running out of GPU memory.
+        Args:
+            device (torch.device): The device to use for inference.
 
-    Args:
-        adj_matrix (torch.Tensor): The large adjacency matrix tensor.
-        seq_len (int): The sequence length.
-        device (torch.device): The device to use for tensor operations.
-
-    Returns:
-        torch.Tensor: The processed adjacency matrix tensor.
-    """
-    chunk_size = 1024  # Adjust this value based on available GPU memory
-    dense_adj_matrix = torch.zeros((seq_len, seq_len), device=device, requires_grad=False)
-
-    # Coalesce the indices of the sparse adjacency matrix
-    adj_matrix = adj_matrix.coalesce()
-
-    num_nonzero = adj_matrix._nnz()  # Use _nnz() to get the number of non-zero elements
-    logger.debug(f"Number of non-zero elements in adjacency matrix: {num_nonzero}")
-
-    for i in range(0, num_nonzero, chunk_size):
-        start = i
-        end = min(i + chunk_size, num_nonzero)
-        indices = adj_matrix._indices()[:, start:end]
-        values = adj_matrix._values()[start:end]
-
-        # Convert the chunk to a dense tensor
-        chunk_tensor = torch.sparse_coo_tensor(
-            indices, values, size=(seq_len, seq_len), device=device
-        ).to_dense()
-
-        # Update the dense adjacency matrix with the chunk
-        valid_row_indices = indices[0].clamp(max=seq_len - 1)
-        valid_col_indices = indices[1].clamp(max=seq_len - 1)
-
-        # Check if the indices are within the bounds of the dense adjacency matrix
-        valid_mask = (valid_row_indices < seq_len) & (valid_col_indices < seq_len)
-
-        # Skip processing if there are no valid indices in the chunk
-        if not valid_mask.any():
-            logger.debug(f"Skipping chunk {start}-{end} due to no valid indices")
-            continue
-
-        # Apply the valid mask to the row and column indices
-        valid_row_indices = valid_row_indices[valid_mask]
-        valid_col_indices = valid_col_indices[valid_mask]
-
-        # Reshape chunk_tensor to match the shape of valid_mask
-        chunk_tensor_reshaped = chunk_tensor.view(-1)[valid_mask]
-
-        # Ensure chunk_tensor_reshaped has the same number of elements as valid indices
-        if chunk_tensor_reshaped.shape[0] != valid_row_indices.shape[0]:
-            logger.error("Shape mismatch between chunk_tensor_reshaped and valid indices")
-            logger.error(f"chunk_tensor_reshaped shape: {chunk_tensor_reshaped.shape}")
-            logger.error(f"valid_row_indices shape: {valid_row_indices.shape}")
-            raise ValueError("Shape mismatch between chunk_tensor_reshaped and valid indices")
-
-        # Update the dense adjacency matrix using the reshaped chunk tensor
-        dense_adj_matrix[valid_row_indices, valid_col_indices] += chunk_tensor_reshaped
-
-    return dense_adj_matrix
+        Yields:
+            None
+        """
+        with torch.no_grad(), torch.inference_mode():
+            yield
