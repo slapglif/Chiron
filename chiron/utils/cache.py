@@ -113,9 +113,9 @@ if __name__ == "__main__":
     # Use Redis for caching
     cache_data(example_data, "example_data")
     data_from_redis = load_cached_data("example_data")
-    print(data_from_redis)
+    logger.info(data_from_redis)
 
     # Use file for debugging
     cache_data_debug(example_data, "temp_data.arrow")
     data_from_file = load_cached_data_debug("temp_data.arrow")
-    print(data_from_file)
+    logger.info(data_from_file)

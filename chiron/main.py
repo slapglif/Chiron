@@ -1,20 +1,16 @@
-# main.py
-
 import argparse
 import os
 import sys
 from collections import Counter
-from typing import Dict, List, Any
+from typing import Dict, List, Any, Generator
+from typing import Optional
 
 import neptune
-import numpy as np
 import torch
 from datasets import load_dataset as data_load
 from loguru import logger
-from scipy.sparse import coo_matrix
-from sklearn.impute import SimpleImputer
 from sklearn.model_selection import KFold
-from sklearn.random_projection import SparseRandomProjection
+from torch import nn
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
@@ -79,116 +75,183 @@ def build_vocab(
     return vocab
 
 
-def lsh_cosine_similarity(
+def compute_top_k_cosine_similarity(
+    batch_embeddings: torch.Tensor,
+    sdr_embeddings_normalized: torch.Tensor,
+    top_k: int,
+    device: torch.device,
+    similarity_batch_size: int = 512,
+) -> torch.Tensor:
+    """
+    Compute the top-k cosine similarity for each embedding in the batch.
+
+    Args:
+        batch_embeddings (torch.Tensor): The batch of embeddings.
+        sdr_embeddings_normalized (torch.Tensor): The normalized SDR embeddings.
+        top_k (int): The number of top similar embeddings to consider.
+        device (torch.device): The device to use for tensor operations.
+        similarity_batch_size (int): The batch size for computing cosine similarity.
+
+    Returns:
+        torch.Tensor: The top-k cosine similarity values and indices for each embedding in the batch.
+    """
+    num_sdr_embeddings = sdr_embeddings_normalized.size(0)
+    num_similarity_batches = (
+        num_sdr_embeddings + similarity_batch_size - 1
+    ) // similarity_batch_size
+
+    top_k_values = torch.zeros((batch_embeddings.size(0), top_k), device=device)
+    top_k_indices = torch.zeros(
+        (batch_embeddings.size(0), top_k), dtype=torch.long, device=device
+    )
+
+    for i in range(num_similarity_batches):
+        start_idx = i * similarity_batch_size
+        end_idx = min((i + 1) * similarity_batch_size, num_sdr_embeddings)
+        similarity_batch = sdr_embeddings_normalized[start_idx:end_idx]
+
+        # Compute the cosine similarity between the batch embeddings and the current similarity batch
+        similarity_matrix = torch.nn.functional.cosine_similarity(
+            batch_embeddings.unsqueeze(1), similarity_batch.unsqueeze(0), dim=2
+        )
+
+        # Update the top-k values and indices
+        batch_top_k_values, batch_top_k_indices = torch.topk(
+            similarity_matrix, k=top_k, dim=1
+        )
+        mask = batch_top_k_values > top_k_values
+        top_k_values[mask] = batch_top_k_values[mask]
+        top_k_indices[mask] = batch_top_k_indices[mask] + start_idx
+
+    return top_k_values, top_k_indices
+
+
+def adjacency_matrix_generator(
     sdr_embeddings: torch.Tensor,
     threshold: float = 0.5,
-    num_projections: int = 128,
-    seed: int = 42,
-    chunk_size: int = 1000,  # Number of embeddings to process at a time
-    batch_size: int = 10000,  # Number of rows to process in each batch
+    batch_size: int = 100,
+    top_k: int = 1000,
+    device: torch.device = torch.device("cpu"),
+    similarity_batch_size: int = 1000,
 ) -> torch.Tensor:
-    num_embeddings = sdr_embeddings.size(0)
-    device = sdr_embeddings.device
+    """
+    Generate batches of the adjacency matrix.
 
-    # Normalize embeddings to unit vectors for cosine similarity calculation
-    sdr_embeddings_normalized = sdr_embeddings / sdr_embeddings.norm(
-        dim=1, keepdim=True
+    Args:
+        sdr_embeddings (torch.Tensor): The SDR embeddings tensor.
+        threshold (float): The cosine similarity threshold for considering two embeddings as neighbors.
+        batch_size (int): The batch size for computing the adjacency matrix.
+        top_k (int): The number of top similar embeddings to consider for each embedding.
+        device (torch.device): The device to use for tensor operations (e.g., torch.device("cuda") for GPU).
+        similarity_batch_size (int): The batch size for computing cosine similarity.
+
+    Yields:
+        torch.Tensor: A batch of the adjacency matrix as a sparse tensor.
+    """
+    num_embeddings = sdr_embeddings.shape[0]
+    num_batches = (num_embeddings + batch_size - 1) // batch_size
+
+    # Move the SDR embeddings tensor to the specified device
+    sdr_embeddings = sdr_embeddings.to(device)
+
+    # Normalize the SDR embeddings
+    sdr_embeddings_normalized = torch.nn.functional.normalize(
+        sdr_embeddings, p=2, dim=1
     )
 
-    # Convert embeddings to numpy array
-    sdr_embeddings_numpy = sdr_embeddings_normalized.cpu().numpy()
+    for i in tqdm(range(num_batches), desc="Generating adjacency matrix batches"):
+        start_idx = i * batch_size
+        end_idx = min((i + 1) * batch_size, num_embeddings)
+        batch_embeddings = sdr_embeddings_normalized[start_idx:end_idx]
 
-    # Create an imputer transformer
-    imputer = SimpleImputer(strategy="mean")
-
-    # Impute missing values
-    sdr_embeddings_imputed = imputer.fit_transform(sdr_embeddings_numpy)
-
-    # Create random projection matrix for LSH
-    random_projection = SparseRandomProjection(
-        n_components=num_projections, random_state=seed
-    )
-
-    # Project embeddings using random projection
-    projected_embeddings = random_projection.fit_transform(sdr_embeddings_imputed)
-
-    # Compute hash codes for projected embeddings
-    hash_codes = np.sign(projected_embeddings).astype(np.int32)
-    hash_codes = np.ascontiguousarray(hash_codes)  # Ensure C-contiguity
-
-    # Initialize lists to store the sparse matrix indices and values
-    row_indices = []
-    col_indices = []
-    values = []
-
-    # Process the adjacency matrix in batches
-    for i in tqdm(range(0, num_embeddings, batch_size), desc="Processing batches"):
-        start = i
-        end = min(i + batch_size, num_embeddings)
-
-        # Compute Hamming distances and populate the adjacency matrix in chunks
-        for j in range(start, end, chunk_size):
-            chunk_start = j
-            chunk_end = min(j + chunk_size, end)
-
-            # Process the embeddings in chunks
-            for k in range(chunk_start, chunk_end):
-                # Compute Hamming distances using memory-efficient operations
-                hamming_distances_chunk = np.sum(
-                    hash_codes[k] != hash_codes[start:end], axis=1
-                )
-                estimated_cosine_similarity_chunk = 1 - hamming_distances_chunk / (
-                    num_projections * 2
-                )
-
-                # Threshold the estimated cosine similarity and store the indices and values
-                mask = estimated_cosine_similarity_chunk >= threshold
-                row_indices.extend([k] * np.count_nonzero(mask))
-                col_indices.extend(np.where(mask)[0] + start)
-                values.extend(estimated_cosine_similarity_chunk[mask])
-
-        # Create a sparse matrix for the current batch
-        batch_adjacency_matrix = coo_matrix(
-            (values, (row_indices, col_indices)), shape=(num_embeddings, num_embeddings)
+        # Compute the top-k cosine similarity for the current batch
+        top_k_values, top_k_indices = compute_top_k_cosine_similarity(
+            batch_embeddings,
+            sdr_embeddings_normalized,
+            top_k,
+            device,
+            similarity_batch_size,
         )
 
-        # Convert the batch adjacency matrix to a sparse COO tensor
-        indices = (
-            torch.from_numpy(
-                np.vstack((batch_adjacency_matrix.row, batch_adjacency_matrix.col))
-            )
-            .long()
-            .to(device)
-        )
-        values = torch.from_numpy(batch_adjacency_matrix.data).float().to(device)
-        batch_adjacency_matrix_tensor = torch.sparse_coo_tensor(
+        # Apply the threshold to create the adjacency matrix for the current batch
+        adjacency_matrix_batch = (top_k_values >= threshold).float()
+
+        # Create the sparse adjacency matrix batch
+        indices = torch.stack(
+            (
+                torch.arange(start_idx, end_idx, device=device)
+                .unsqueeze(1)
+                .expand_as(top_k_indices),
+                top_k_indices,
+            ),
+            dim=0,
+        ).view(2, -1)
+        values = adjacency_matrix_batch.view(-1)
+        adjacency_matrix_batch = torch.sparse_coo_tensor(
             indices, values, (num_embeddings, num_embeddings), device=device
         )
 
-        # Yield the batch adjacency matrix tensor
-        yield batch_adjacency_matrix_tensor
-
-        # Clear the lists for the next batch
-        row_indices.clear()
-        col_indices.clear()
-        values.clear()
+        yield adjacency_matrix_batch
 
 
-def create_adjacency_matrix_lsh(
+def compute_and_save_adjacency_matrix(
     sdr_embeddings: torch.Tensor,
     threshold: float = 0.5,
-    num_projections: int = 128,
-    seed: int = 42,
-) -> torch.sparse.Tensor:
-    adjacency_matrix_sparse = lsh_cosine_similarity(
-        sdr_embeddings, threshold, num_projections, seed
+    batch_size: int = 100,
+    top_k: int = 1000,
+    output_file_prefix: str = "adjacency_matrix_batch_",
+    device: torch.device = torch.device("cpu"),
+    similarity_batch_size: int = 1000,
+) -> None:
+    """
+    Compute the adjacency matrix from SDR embeddings using cosine similarity and save it in batches.
+
+    Args:
+        sdr_embeddings (torch.Tensor): The SDR embeddings tensor.
+        threshold (float): The cosine similarity threshold for considering two embeddings as neighbors.
+        batch_size (int): The batch size for computing the adjacency matrix.
+        top_k (int): The number of top similar embeddings to consider for each embedding.
+        output_file_prefix (str): The prefix for the output file names of the adjacency matrix batches.
+        device (torch.device): The device to use for tensor operations (e.g., torch.device("cuda") for GPU).
+        similarity_batch_size (int): The batch size for computing cosine similarity.
+    """
+    # Compute the adjacency matrix in batches
+    adjacency_matrix_batches = adjacency_matrix_generator(
+        sdr_embeddings, threshold, batch_size, top_k, device, similarity_batch_size
     )
-    return adjacency_matrix_sparse
+
+    # Save each batch of the adjacency matrix to a separate file
+    for i, batch in enumerate(adjacency_matrix_batches):
+        output_file = f"{output_file_prefix}{i}.pt"
+        torch.save(batch, output_file)
+        logger.info(f"Adjacency matrix batch {i} saved to: {output_file}")
+
+
+def load_adjacency_matrix_batches(
+    output_file_prefix: str, num_batches: int, device: Optional[torch.device] = None
+) -> Generator[torch.Tensor, None, None]:
+    """
+    Load the adjacency matrix batches from files.
+
+    Args:
+        output_file_prefix (str): The prefix for the output file names of the adjacency matrix batches.
+        num_batches (int): The number of batches to load.
+        device (torch.device, optional): The device to load the batches on. If not provided, the batches
+            will be loaded on the same device as they were saved.
+
+    Yields:
+        torch.Tensor: The loaded adjacency matrix batches.
+    """
+    for i in range(num_batches):
+        output_file = f"{output_file_prefix}{i}.pt"
+        batch = torch.load(output_file, map_location=device)
+        yield batch
 
 
 def main(config_path: str) -> None:
     """
     Main function to run the Semantic Folding training pipeline with k-fold cross-validation.
+
     Args:
         config_path (str): Path to the configuration file.
     """
@@ -254,21 +317,22 @@ def main(config_path: str) -> None:
     # Generate SDRs
     logger.info("Generating SDRs...")
     sdr_generator = SDRGenerator(**config["sdr_params"])
-    sdr_embeddings: np.ndarray = sdr_generator.generate_sdr_embeddings(embeddings)
+    sdr_embeddings: torch.Tensor = torch.tensor(
+        sdr_generator.generate_sdr_embeddings(embeddings), dtype=torch.float32
+    )
     logger.info(f"SDR embeddings shape: {sdr_embeddings.shape}")
 
     # Create an adjacency matrix
     logger.info("Creating adjacency matrix...")
     device = torch.device(config["device"])
-    sdr_embeddings_tensor = torch.from_numpy(sdr_embeddings).float().to(device)
 
-    # Create an adjacency matrix using LSH
-    logger.info("Creating adjacency matrix using LSH...")
-    adjacency_matrix_sparse = create_adjacency_matrix_lsh(
-        sdr_embeddings_tensor,
+    # Compute and save the adjacency matrix
+    logger.info("Computing and saving adjacency matrix...")
+    compute_and_save_adjacency_matrix(
+        sdr_embeddings,
         threshold=config["adjacency_matrix"]["threshold"],
-        num_projections=config["adjacency_matrix"]["num_projections"],
-        seed=config["adjacency_matrix"]["seed"],
+        batch_size=config["adjacency_matrix"]["batch_size"],
+        device=device,
     )
 
     tokenizer = BertTokenizer.from_pretrained(config["tokenizer"]["name"])
@@ -277,7 +341,6 @@ def main(config_path: str) -> None:
     vocab = build_vocab(
         preprocessed_conversations, max_vocab_size=preprocessor.max_vocab_size
     )
-
     # Create dataset
     dataset = SemanticFoldingDataset(sdr_embeddings, tokenizer, labels=None)
 
@@ -297,6 +360,7 @@ def main(config_path: str) -> None:
             shuffle=True,
             num_workers=config["num_workers"] or 4,
             pin_memory=True,
+            persistent_workers=True,
         )
 
         val_dataloader = DataLoader(
@@ -305,6 +369,7 @@ def main(config_path: str) -> None:
             shuffle=False,
             num_workers=config["num_workers"] or 4,
             pin_memory=True,
+            persistent_workers=True,
         )
 
         logger.info(f"Creating SNN model for fold {fold + 1}...")
@@ -318,6 +383,10 @@ def main(config_path: str) -> None:
             snn_params=config["snn_params"],
         ).to(device)
 
+        if torch.cuda.device_count() > 1:
+            logger.info(f"Using {torch.cuda.device_count()} GPUs")
+            snn_model = nn.DataParallel(snn_model)
+
         # Train model
         train_config = {
             "num_epochs": config["num_epochs"],
@@ -327,15 +396,19 @@ def main(config_path: str) -> None:
         }
 
         logger.info(f"Training model for fold {fold + 1}...")
+        scaler = (
+            torch.cuda.amp.GradScaler()
+        )  # Initialize the GradScaler for mixed precision training
+
         train_losses, val_losses = train(
             snn_model,
             train_dataloader,
             val_dataloader,
             tokenizer,
             train_config,
-            device,
-            adjacency_matrix_sparse,
+            device,  # Pass the output directory for loading adjacency matrix chunks
             writer,
+            scaler,  # Pass the GradScaler to the train function
         )
 
         # Log training and validation losses to Neptune

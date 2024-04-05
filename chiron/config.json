@@ -2,7 +2,7 @@
   "dataset_params": {
     "dataset_name": "teknium/OpenHermes-2.5",
     "dataset_config": "default",
-    "split": "train[:25%]"
+    "split": "train[:50%]"
   },
   "longformer_params": {
     "hidden_size": 768,
@@ -72,7 +72,9 @@
     "subsample_rate": 0.02,
     "num_permutations": 128,
     "lsh_bucket_size": 128,
-    "batch_size": 10000
+    "batch_size": 100000,
+    "chunk_size": 100000
+
   },
   "labels": [],
   "accumulation_steps": 16,

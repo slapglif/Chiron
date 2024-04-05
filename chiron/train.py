@@ -1,5 +1,7 @@
 import os
 import datetime
+from collections.abc import Generator
+
 import safetensors
 import torch
 import torch.nn as nn
@@ -75,7 +77,7 @@ def train(
     tokenizer: PreTrainedTokenizer,
     config: dict,
     device: torch.device,
-    adjacency_matrix_sparse: torch.sparse_coo_tensor,
+    adjacency_matrix_batches: Generator[torch.Tensor, None, None],
     writer: SummaryWriter,
     checkpoint_dir: str = ".checkpoints",
     resume_from_latest: bool = True,
@@ -91,7 +93,7 @@ def train(
         tokenizer (PreTrainedTokenizer): The tokenizer for the language model.
         config (dict): The training configuration.
         device (torch.device): The device to run the training on.
-        adjacency_matrix_sparse (torch.sparse_coo_tensor): The adjacency matrix in sparse COO format.
+        adjacency_matrix_batches (Generator[torch.Tensor, None, None]): Generator of batch adjacency matrix tensors.
         writer (SummaryWriter): The TensorBoard writer for logging.
         checkpoint_dir (str): The directory to save checkpoints.
         resume_from_latest (bool): Whether to resume training from the latest checkpoint.
@@ -122,7 +124,8 @@ def train(
                 latest_checkpoint_path, model, optimizer, scheduler
             )
             logger.info(
-                f"Resuming training from the latest checkpoint: {latest_checkpoint_path}"
+                f"Resuming training from the latest checkpoint: "
+                f"{latest_checkpoint_path}"
             )
         else:
             logger.info(
@@ -156,7 +159,7 @@ def train(
             # Get the input tensors and labels
             input_ids, attention_mask, label, node_indices = batch
             input_ids = input_ids.to(device)
-            attention_mask = attention_mask.to(device)
+            # attention_mask = attention_mask.to(device)
             node_indices = node_indices.to(device)
 
             # Clamp node_indices to the valid range
@@ -173,7 +176,7 @@ def train(
                 # Forward pass
                 outputs = model(
                     input_ids,
-                    adjacency_matrix_sparse,
+                    adjacency_matrix_batches,
                 )
 
                 # Reshape outputs to match the shape of class_indices
@@ -206,7 +209,7 @@ def train(
 
         # Evaluate on the validation set
         val_loss = evaluate(
-            model, val_dataloader, tokenizer, device, adjacency_matrix_sparse
+            model, val_dataloader, tokenizer, device, adjacency_matrix_batches
         )
         val_losses.append(val_loss)
 
@@ -257,16 +260,18 @@ def evaluate(
     dataloader: DataLoader,
     tokenizer: PreTrainedTokenizer,
     device: torch.device,
-    adjacency_matrix_sparse: torch.sparse.Tensor,
+    adjacency_matrix_batches: Generator[torch.Tensor, None, None],
 ) -> float:
     """
     Evaluate the model on the given dataset.
+
     Args:
         model (SNNModel): The model to evaluate.
         dataloader (DataLoader): The data loader for evaluation.
         tokenizer (PreTrainedTokenizer): The tokenizer for the language model.
         device (torch.device): The device to run the evaluation on.
-        adjacency_matrix_sparse (torch.sparse.Tensor): The adjacency matrix in sparse format.
+        adjacency_matrix_batches (Generator[torch.Tensor, None, None]): Generator of batch adjacency matrix tensors.
+
     Returns:
         float: The average loss on the evaluation dataset.
     """
@@ -290,7 +295,7 @@ def evaluate(
 
             # Forward pass
             outputs = model(
-                input_ids, attention_mask, adjacency_matrix_sparse, node_indices
+                input_ids, attention_mask, adjacency_matrix_batches, node_indices
             )
 
             # Compute the loss
@@ -303,7 +308,7 @@ def evaluate(
 
     # Compute evaluation metrics
     text_prediction_metrics = evaluate_text_prediction(
-        model, tokenizer, dataloader.dataset, device, adjacency_matrix_sparse
+        model, tokenizer, dataloader.dataset, device, adjacency_matrix_batches
     )
     logger.info(f"Text Prediction Metrics: {text_prediction_metrics}")
 

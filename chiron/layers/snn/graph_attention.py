@@ -16,6 +16,7 @@ class GraphAttentionLayer(nn.Module):
         dropout: float = 0.0,
         alpha: float = 0.2,
         concat: bool = True,
+        fallback_mode: str = "dense",
     ):
         super(GraphAttentionLayer, self).__init__()
         self.in_features = in_features
@@ -23,9 +24,13 @@ class GraphAttentionLayer(nn.Module):
         self.num_heads = num_heads
         self.alpha = alpha
         self.concat = concat
+        self.fallback_mode = fallback_mode
 
         # Calculate the number of output features per attention head
-        self.out_features_per_head = out_features // num_heads
+        if concat:
+            self.out_features_per_head = out_features // num_heads
+        else:
+            self.out_features_per_head = out_features
 
         # Initialize the linear transformation weight matrix
         self.W = nn.Parameter(
@@ -122,7 +127,25 @@ class GraphAttentionLayer(nn.Module):
                 logger.warning(
                     "edge_indices tensor has an invalid shape along the last dimension."
                 )
-                mask = torch.zeros_like(attn_scores, dtype=torch.bool)
+                if self.fallback_mode == "dense":
+                    # If fallback_mode is "dense", compute attention scores without the adjacency matrix mask
+                    mask = None
+                elif self.fallback_mode == "identity":
+                    # If fallback_mode is "identity", apply an identity mask
+                    mask_shape = (
+                        batch_size,
+                        self.num_heads,
+                        seq_len,
+                        seq_len,
+                    )
+                    mask = (
+                        torch.eye(seq_len, device=attn_scores.device)
+                        .unsqueeze(0)
+                        .unsqueeze(0)
+                        .repeat(batch_size, self.num_heads, 1, 1)
+                    )
+                else:
+                    raise ValueError(f"Invalid fallback_mode: {self.fallback_mode}")
             else:
                 # Create the mask tensor with the correct shape
                 mask_shape = (
@@ -137,7 +160,8 @@ class GraphAttentionLayer(nn.Module):
                 mask[edge_indices[0], :, edge_indices[1], edge_indices[1]] = True
 
             # Apply the mask to the attention scores
-            attn_scores = attn_scores.masked_fill(~mask, float("-inf"))
+            if mask is not None:
+                attn_scores = attn_scores.masked_fill(~mask, float("-inf"))
 
         # Apply softmax to normalize the attention scores
         attn_probs = nn.functional.softmax(attn_scores, dim=-1)
