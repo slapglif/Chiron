@@ -6,13 +6,43 @@ import safetensors
 import torch
 import torch.nn as nn
 from loguru import logger
+from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 from transformers import PreTrainedTokenizer
+from typing import List, Tuple
+
 from chiron.layers.snn.model import SNNModel
 
 from chiron.evaluation.metrics import evaluate_text_prediction
+
+
+def collate_fn(batch: List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]]) -> Tuple[
+    torch.Tensor, torch.Tensor, List[torch.Tensor], torch.Tensor]:
+    """
+    Custom collate function to handle variable-length sequences in a batch.
+
+    Args:
+        batch (List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]]): List of samples from the dataset.
+
+    Returns:
+        Tuple[torch.Tensor, torch.Tensor, List[torch.Tensor], torch.Tensor]: A tuple containing the padded input_ids,
+            attention_mask, labels (as a list of tensors), and node_indices.
+    """
+    input_ids, attention_mask, labels, node_indices = zip(*batch)
+
+    # Pad input_ids and attention_mask
+    padded_input_ids = pad_sequence(input_ids, batch_first=True, padding_value=0)
+    padded_attention_mask = pad_sequence(attention_mask, batch_first=True, padding_value=0)
+
+    # Convert labels to a list of tensors (without padding)
+    labels = [label for label in labels]
+
+    # Convert node_indices to tensor
+    node_indices = torch.tensor(node_indices, dtype=torch.long)
+
+    return padded_input_ids, padded_attention_mask, labels, node_indices
 
 
 def save_checkpoint(epoch, model, optimizer, scheduler, checkpoint_dir, model_name):
@@ -138,7 +168,7 @@ def train(
     # Set the number of accumulation steps
     accumulation_steps = config["accumulation_steps"]
 
-    # Enable mixed-precision training
+    # Initialize the GradScaler for mixed-precision training
     scaler = torch.cuda.amp.GradScaler()
 
     # Initialize lists to store training and validation losses
@@ -157,19 +187,19 @@ def train(
             tqdm(train_dataloader, desc="Train"), start=1
         ):
             # Get the input tensors and labels
-            input_ids, attention_mask, label, node_indices = batch
+            input_ids, attention_mask, labels, node_indices = batch
             input_ids = input_ids.to(device)
-            # attention_mask = attention_mask.to(device)
-            node_indices = node_indices.to(device)
+            # # attention_mask = attention_mask.to(device)
+            # node_indices = node_indices.to(device)
 
-            # Clamp node_indices to the valid range
-            node_indices = node_indices.clamp(min=0, max=num_classes - 1)
+            # # Clamp node_indices to the valid range
+            # node_indices = node_indices.clamp(min=0, max=num_classes - 1)
 
-            # Convert node_indices to class indices using the mapping
-            class_indices = torch.tensor(
-                [node_to_class_mapping[idx.item()] for idx in node_indices],
-                device=device,
-            )
+            # # Convert node_indices to class indices using the mapping
+            # class_indices = torch.tensor(
+            #     [node_to_class_mapping[idx.item()] for idx in node_indices],
+            #     device=device,
+            # )
 
             # Mixed-precision training
             with torch.cuda.amp.autocast():
@@ -179,11 +209,13 @@ def train(
                     adjacency_matrix_batches,
                 )
 
-                # Reshape outputs to match the shape of class_indices
-                outputs = outputs.view(-1, num_classes)
-
                 # Compute the loss
-                loss = criterion(outputs, class_indices)
+                losses = []
+                for i in range(len(outputs)):
+                    loss = criterion(outputs[i].view(-1, outputs[i].size(-1)), labels[i].view(-1))
+                    losses.append(loss)
+
+                loss = torch.stack(losses).mean()  # Take the mean of the losses
                 loss = loss / accumulation_steps
 
             # Backward pass with mixed-precision
@@ -276,22 +308,19 @@ def evaluate(
         float: The average loss on the evaluation dataset.
     """
     model.eval()
-    criterion = nn.CrossEntropyLoss(reduction="mean")  # Use mean reduction
+    criterion = nn.NLLLoss()
     total_loss = 0.0
 
     with torch.no_grad():
         for batch in tqdm(dataloader, desc="Evaluating"):
             # Get the input tensors and labels
-            input_ids, attention_mask, label, node_indices = batch
+            input_ids, attention_mask, labels, node_indices = batch
 
             # Move the input tensors and labels to the device
             input_ids = input_ids.to(device)
             attention_mask = attention_mask.to(device)
-            label = label.to(device)
+            labels = [label.to(device) for label in labels]
             node_indices = node_indices.to(device)
-
-            # Ensure the label tensor is 1D
-            label = label.squeeze(1)
 
             # Forward pass
             outputs = model(
@@ -299,7 +328,12 @@ def evaluate(
             )
 
             # Compute the loss
-            loss = criterion(outputs.view(-1, outputs.size(-1)), label.view(-1))
+            losses = []
+            for i in range(len(outputs)):
+                loss = criterion(outputs[i].view(-1, outputs[i].size(-1)), labels[i].view(-1))
+                losses.append(loss)
+
+            loss = torch.stack(losses).mean()  # Take the mean of the losses
 
             # Accumulate the loss
             total_loss += loss.item()

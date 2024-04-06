@@ -64,7 +64,7 @@ class SDRGenerator:
         # Filter out empty or invalid embeddings and validate data
         valid_embeddings = [
             emb
-            for emb in embeddings
+            for emb in tqdm(embeddings, desc="Filtering Invalid Embeddings...")
             if emb.size > 0 and not np.isnan(emb).any() and not np.isinf(emb).any()
         ]
 
@@ -76,10 +76,12 @@ class SDRGenerator:
         concatenated_embeddings = np.vstack(valid_embeddings)
 
         try:
+            logger.info("Reducing Embedding Dimensionality...")
             # Dimensionality reduction using SVD
             reduced_embeddings = self.projection.fit_transform(concatenated_embeddings)
 
             # Binarize the reduced embeddings to generate SDRs
+            logger.info("Binarize the reduced embeddings...")
             threshold = np.percentile(reduced_embeddings, (1 - self.sparsity) * 100)
             sdr_embeddings = []
             for embedding in tqdm(reduced_embeddings, desc="Generating SDRs"):

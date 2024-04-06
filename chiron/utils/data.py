@@ -36,9 +36,7 @@ class SemanticFoldingDataset(Dataset):
         """
         return len(self.sdr_embeddings)
 
-    def __getitem__(
-        self, index: int
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
+    def __getitem__(self, index: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
         """
         Get a sample from the dataset.
 
@@ -57,9 +55,7 @@ class SemanticFoldingDataset(Dataset):
         node_index = index
 
         # Tokenize the input using the tokenizer
-        input_ids = self.tokenizer.encode(
-            str(sdr_embedding), return_tensors="pt"
-        ).squeeze(0)
+        input_ids = self.tokenizer.encode(str(sdr_embedding), return_tensors="pt").squeeze(0)
         attention_mask = torch.ones_like(input_ids)
 
-        return input_ids, attention_mask, label, node_index
+        return input_ids, attention_mask, label.clone().detach(), node_index

@@ -67,14 +67,11 @@
   "learning_rate": 0.0001,
   "adjacency_matrix": {
     "threshold": 0.5,
-    "num_projections": 64,
-    "seed": 42,
-    "subsample_rate": 0.02,
-    "num_permutations": 128,
-    "lsh_bucket_size": 128,
-    "batch_size": 100000,
-    "chunk_size": 100000
-
+    "batch_size": 100,
+    "top_k": 1000,
+    "output_file_prefix": "adjacency_matrix_batch_",
+    "output_file": "output/adj_matrix.npz",
+    "similarity_batch_size": 100
   },
   "labels": [],
   "accumulation_steps": 16,

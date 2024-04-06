@@ -403,6 +403,114 @@ class SNNModel(nn.Module):
                 "Input must be a torch.Tensor, torch.sparse.Tensor, or a Generator of torch.Tensor"
             )
 
+    def generate(
+            self,
+            input_conversation: list,
+            adjacency_matrix: torch.Tensor,
+            node_indices: torch.Tensor,
+            max_length: int = 100,
+            num_return_sequences: int = 1,
+            temperature: float = 0.7,
+            top_k: int = 50,
+            top_p: float = 0.9,
+            mirostat_eta: float = 0.1,
+            mirostat_tau: float = 5.0,
+            **_,
+    ) -> list:
+        """
+        Generate responses based on the input conversation.
+
+        Args:
+            input_conversation (list): The input conversation as a list of strings or tensors.
+            adjacency_matrix (torch.Tensor): The adjacency matrix tensor.
+            node_indices (torch.Tensor): The node indices tensor.
+            max_length (int): The maximum length of the generated response.
+            num_return_sequences (int): The number of responses to generate.
+            temperature (float): The temperature for sampling.
+            top_k (int): The number of top-k tokens to consider for filtering.
+            top_p (float): The cumulative probability threshold for filtering.
+            mirostat_eta (float): The learning rate for Mirostat.
+            mirostat_tau (float): The target entropy for Mirostat.
+
+        Returns:
+            list: The generated conversations as a list of strings.
+        """
+        generated_conversations = []
+
+        # Convert the input conversation to a list of strings
+        string_conversation = [
+            str(turn.item()) if isinstance(turn, torch.Tensor) else str(turn)
+            for turn in input_conversation
+        ]
+
+        # Check if the input conversation is empty
+        if not string_conversation:
+            logger.warning("Input conversation is empty. Skipping generation.")
+            return generated_conversations
+
+        for _ in range(num_return_sequences):
+            generated_conversation = []
+
+            # Concatenate the input conversation to start the generation
+            input_text = " ".join(string_conversation)
+            generated_conversation.append(input_text)
+
+            # Initialize Mirostat parameters
+            mirostat_mu = 2.0 * mirostat_tau
+            mirostat_s = 1.0
+
+            # Tokenize the input conversation
+            input_ids = self.tokenizer.encode(input_text, return_tensors="pt").to(self.device)
+            attention_mask = torch.ones_like(input_ids, dtype=torch.long).to(self.device)
+
+            response = []
+            while len(response) < max_length:
+                # Forward pass
+                if adjacency_matrix is None or node_indices is None:
+                    # If adjacency_matrix or node_indices are not provided, create dummy values
+                    dummy_adj_matrix = torch.eye(
+                        input_ids.size(-1), dtype=torch.bool
+                    ).to(self.device)
+                    output = self.forward(input_ids, dummy_adj_matrix)
+                else:
+                    output = self.forward(input_ids, adjacency_matrix)
+
+                # Sample from the model's output distribution
+                output_logits = output[:, -1, :] / temperature
+                filtered_logits = self._top_k_top_p_filtering(
+                    output_logits, top_k=top_k, top_p=top_p
+                )
+                probabilities = torch.softmax(filtered_logits, dim=-1)
+                next_token = torch.multinomial(probabilities, num_samples=1)
+
+                # Update Mirostat parameters
+                mirostat_s = (
+                        mirostat_eta * (output_logits.max().item() - mirostat_tau)
+                        + (1 - mirostat_eta) * mirostat_s
+                )
+                mirostat_mu = mirostat_mu * torch.exp(mirostat_s)
+                temperature = max(0.1, temperature * (mirostat_tau / mirostat_mu))
+
+                # Check if the generated token is the end-of-sequence token
+                if next_token.item() == self.tokenizer.eos_token_id:
+                    break
+
+                response.append(next_token.item())
+                input_ids = torch.cat([input_ids, next_token], dim=-1)
+                attention_mask = torch.cat(
+                    [
+                        attention_mask,
+                        torch.tensor([1], device=self.device, dtype=torch.long),
+                    ],
+                    dim=-1,
+                )
+
+            # Add the generated response to the conversation
+            generated_response = self.tokenizer.decode(response)
+            generated_conversation.append(generated_response)
+            generated_conversations.append(generated_conversation)
+
+        return generated_conversations
 
 class InputDataset(Dataset):
     def __init__(self, input_ids_batches):
