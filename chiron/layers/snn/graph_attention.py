@@ -1,3 +1,7 @@
+from typing import Union
+
+import numpy as np
+import scipy
 import torch
 import torch.nn as nn
 from loguru import logger
@@ -61,111 +65,66 @@ class GraphAttentionLayer(nn.Module):
             torch.Tensor: Attention scores of shape (batch_size, num_heads, seq_len, seq_len).
         """
         batch_size, seq_len, num_features = input_tensor.size()
+        logger.debug(f"Input tensor shape in _compute_attention_scores: {input_tensor.shape}")
 
         # Reshape the input tensor to (batch_size, seq_len, num_heads, out_features_per_head)
         input_tensor = input_tensor.view(batch_size, seq_len, self.num_heads, -1)
+        logger.debug(f"Reshaped input tensor shape in _compute_attention_scores: {input_tensor.shape}")
 
         # Compute the attention scores using the attention mechanism coefficient
         attn_scores = torch.einsum("bihk,bjhk->bhij", input_tensor, input_tensor)
+        logger.debug(f"Attention scores shape before activation in _compute_attention_scores: {attn_scores.shape}")
         attn_scores = self.leakyrelu(attn_scores)
+        logger.debug(f"Attention scores shape after activation in _compute_attention_scores: {attn_scores.shape}")
 
         return attn_scores
 
-    def forward(
-        self,
-        input_tensor: torch.Tensor,
-        adj_matrix: torch.sparse.Tensor = None,
-    ) -> torch.Tensor:
+    def forward(self, input_tensor: torch.Tensor,
+                adj_matrix: Union[np.ndarray, scipy.sparse.csr_matrix, torch.Tensor] = None) -> torch.Tensor:
         """
         Compute the output features for the input tensor.
 
         Args:
             input_tensor (torch.Tensor): Input tensor of shape (batch_size, seq_len, num_features).
-            adj_matrix (torch.sparse.Tensor, optional): Adjacency matrix tensor of shape (seq_len, seq_len). Default is None.
+            adj_matrix (Union[np.ndarray, scipy.sparse.csr_matrix, torch.Tensor], optional): Adjacency matrix as a NumPy array, a SciPy sparse matrix, or a PyTorch tensor of shape (seq_len, seq_len). Default is None.
 
         Returns:
             torch.Tensor: Output tensor of shape (batch_size, seq_len, num_heads * out_features_per_head) or (batch_size, seq_len, out_features).
         """
         batch_size, seq_len, num_features = input_tensor.size()
+        logger.debug(f"input_tensor shape: {input_tensor.shape}")
 
         # Compute attention scores
         attn_scores = self._compute_attention_scores(input_tensor)
+        logger.debug(f"attn_scores shape: {attn_scores.shape}")
 
         # Apply the adjacency matrix mask to the attention scores (if provided)
         if adj_matrix is not None:
-            num_nodes = adj_matrix.size(0)
-            if num_nodes < seq_len:
-                # If the adjacency matrix has fewer nodes than the sequence length,
-                # pad the adjacency matrix with identity connections for the remaining nodes.
-                indices = adj_matrix._indices()
-                values = adj_matrix._values()
-                indices = indices.clamp(max=seq_len - 1)
-                adj_matrix = torch.sparse_coo_tensor(
-                    indices,
-                    values,
-                    size=(seq_len, seq_len),
-                    device=adj_matrix.device,
-                )
-            elif num_nodes > seq_len:
-                # If the adjacency matrix has more nodes than the sequence length,
-                # clip the adjacency matrix to the sequence length.
-                indices = adj_matrix._indices()
-                values = adj_matrix._values()
-                mask = (indices[0] < seq_len) & (indices[1] < seq_len)
-                indices = indices[:, mask]
-                values = values[mask]
-                adj_matrix = torch.sparse_coo_tensor(
-                    indices,
-                    values,
-                    size=(seq_len, seq_len),
-                    device=adj_matrix.device,
-                )
-
-            edge_indices = adj_matrix._indices()
-
-            if edge_indices.shape[-1] == 0:
-                logger.warning(
-                    "edge_indices tensor has an invalid shape along the last dimension."
-                )
-                if self.fallback_mode == "dense":
-                    # If fallback_mode is "dense", compute attention scores without the adjacency matrix mask
-                    mask = None
-                elif self.fallback_mode == "identity":
-                    # If fallback_mode is "identity", apply an identity mask
-                    mask_shape = (
-                        batch_size,
-                        self.num_heads,
-                        seq_len,
-                        seq_len,
-                    )
-                    mask = (
-                        torch.eye(seq_len, device=attn_scores.device)
-                        .unsqueeze(0)
-                        .unsqueeze(0)
-                        .repeat(batch_size, self.num_heads, 1, 1)
-                    )
-                else:
-                    raise ValueError(f"Invalid fallback_mode: {self.fallback_mode}")
+            if isinstance(adj_matrix, np.ndarray):
+                # Convert the adjacency matrix to a PyTorch tensor
+                adj_matrix_tensor = torch.from_numpy(adj_matrix).to(input_tensor.device)
+            elif isinstance(adj_matrix, scipy.sparse.csr_matrix):
+                # Convert the sparse adjacency matrix to a dense PyTorch tensor
+                adj_matrix_tensor = torch.from_numpy(adj_matrix.toarray()).to(input_tensor.device)
+            elif isinstance(adj_matrix, torch.Tensor):
+                # Adjacency matrix is already a PyTorch tensor
+                adj_matrix_tensor = adj_matrix.to(input_tensor.device)
             else:
-                # Create the mask tensor with the correct shape
-                mask_shape = (
-                    batch_size,
-                    self.num_heads,
-                    seq_len,
-                    seq_len,
-                )
-                mask = torch.zeros(
-                    mask_shape, dtype=torch.bool, device=attn_scores.device
-                )
-                mask[edge_indices[0], :, edge_indices[1], edge_indices[1]] = True
+                raise TypeError(f"Unsupported type for adj_matrix: {type(adj_matrix)}")
 
-            # Apply the mask to the attention scores
-            if mask is not None:
-                attn_scores = attn_scores.masked_fill(~mask, float("-inf"))
+            # Ensure the adjacency matrix tensor has the correct shape
+            assert adj_matrix_tensor.shape == (seq_len, seq_len), f"Adjacency matrix should have shape (seq_len, seq_len), but got {adj_matrix_tensor.shape}"
+
+            # Expand the adjacency matrix tensor to match the shape of attn_scores
+            adj_matrix_tensor = adj_matrix_tensor.unsqueeze(0).unsqueeze(0).expand(batch_size, self.num_heads, seq_len, seq_len)
+
+            # Mask the attention scores with the adjacency matrix
+            attn_scores = attn_scores.masked_fill(adj_matrix_tensor == 0, float('-inf'))
 
         # Apply softmax to normalize the attention scores
         attn_probs = nn.functional.softmax(attn_scores, dim=-1)
         attn_probs = self.dropout(attn_probs)
+        logger.debug(f"attn_probs shape: {attn_probs.shape}")
 
         # Reshape the input tensor to (batch_size, seq_len, num_heads, out_features_per_head)
         input_tensor = input_tensor.view(batch_size, seq_len, self.num_heads, -1)

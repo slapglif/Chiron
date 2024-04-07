@@ -47,7 +47,7 @@
     "seed": 42
   },
   "snn_params": {
-    "input_size": 132,
+    "input_size": 256,
     "hidden_size": 64,
     "output_size": 128,
     "timesteps": 10

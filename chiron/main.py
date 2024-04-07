@@ -1,21 +1,15 @@
 import argparse
 import os
 import sys
-from collections import Counter
-from typing import Dict, List, Any, Generator
+from typing import Dict, List, Any
 
 import neptune
-import numpy as np
-import torch
 from datasets import load_dataset as data_load
-from loguru import logger
-from scipy.sparse import lil_matrix, load_npz, csr_matrix, save_npz
+from scipy.sparse import load_npz
 from sklearn.model_selection import KFold
 from torch import nn
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
-from torch.nn.utils.rnn import pad_sequence
-from tqdm import tqdm
 from transformers import BertTokenizer
 
 from chiron.layers.sdr.sdr_generation import SDRGenerator
@@ -51,53 +45,27 @@ def load_dataset(config: Config) -> List[List[Dict[str, Any]]]:
     return conversations
 
 
-def build_vocab(
-    preprocessed_conversations: List[str], max_vocab_size: int
-) -> Dict[str, int]:
-    """
-    Build a vocabulary from the preprocessed conversations.
-
-    Args:
-        preprocessed_conversations (List[str]): List of preprocessed conversations.
-        max_vocab_size (int): Maximum size of the vocabulary.
-
-    Returns:
-        Dict[str, int]: Vocabulary dictionary mapping tokens to indices.
-    """
-    vocab = {"<PAD>": 0, "<UNK>": 1}
-    token_counts: Counter = TextPreprocessor.count_token_frequencies(
-        preprocessed_conversations
-    )
-
-    for idx, (token, count) in enumerate(
-        token_counts.most_common(max_vocab_size - 2), start=2
-    ):
-        vocab[token] = idx
-
-    return vocab
+import torch
+from tqdm import tqdm
+from scipy.sparse import csr_matrix, save_npz
+from loguru import logger
+from sklearn.cluster import KMeans, DBSCAN
+import numpy as np
 
 
-def adjacency_matrix_generator(
-    sdr_embeddings: torch.Tensor,
-    threshold: float = 0.5,
-    batch_size: int = 32,
-    device: torch.device = torch.device("cpu"),
-) -> Generator[torch.Tensor, None, None]:
-    """
-    Generate batches of the adjacency matrix.
-
-    Args:
-        sdr_embeddings (torch.Tensor): The SDR embeddings tensor.
-        threshold (float): The similarity threshold for considering two embeddings as neighbors.
-        batch_size (int): The batch size for computing the adjacency matrix.
-        device (torch.device): The device to use for tensor operations (e.g., torch.device("cuda") for GPU).
-
-    Yields:
-        torch.Tensor: A batch of the adjacency matrix as a sparse tensor.
-    """
-    num_embeddings = sdr_embeddings.shape[0]
-    num_batches = (num_embeddings + batch_size - 1) // batch_size
-
+def compute_and_save_adjacency_matrix(
+        sdr_embeddings: torch.Tensor,
+        threshold: float = 0.5,
+        batch_size: int = 256,
+        output_file: str = "adjacency_matrix.npz",
+        device: torch.device = torch.device("cuda:0"),
+        fallback_mode: str = "subsample",
+        subsample_ratio: float = 0.01,
+        num_clusters: int = 100,
+        eps: float = 0.5,
+        min_samples: int = 10,
+        chunk_size: int = 10000,
+) -> None:
     # Move the SDR embeddings tensor to the specified device
     sdr_embeddings = sdr_embeddings.to(device)
 
@@ -106,53 +74,101 @@ def adjacency_matrix_generator(
         sdr_embeddings, p=2, dim=1
     )
 
-    # Create a sparse matrix in LIL format to store the adjacency matrix
-    adjacency_matrix = lil_matrix((num_embeddings, num_embeddings), dtype=np.float32)
-    for i in tqdm(range(num_batches), desc="Generating adjacency matrix batches"):
-        start_idx = i * batch_size
-        end_idx = min((i + 1) * batch_size, num_embeddings)
-        batch_embeddings = sdr_embeddings_normalized[start_idx:end_idx]
+    num_embeddings = sdr_embeddings.shape[0]
 
-        # Compute the similarity within the current batch
-        similarity_matrix = torch.matmul(batch_embeddings, batch_embeddings.T)
+    if fallback_mode == "subsample":
+        # Perform subsampling
+        subsample_size = int(num_embeddings * subsample_ratio)
+        subsample_indices = np.random.choice(num_embeddings, size=subsample_size, replace=False)
+        sdr_embeddings_normalized = sdr_embeddings_normalized[subsample_indices]
+        num_embeddings = subsample_size
+    elif fallback_mode == "cluster":
+        # Perform clustering
+        if num_embeddings <= 10000:
+            clustering_model = KMeans(n_clusters=num_clusters, random_state=42)
+        else:
+            clustering_model = DBSCAN(eps=eps, min_samples=min_samples, n_jobs=-1)
+        cluster_labels = clustering_model.fit_predict(sdr_embeddings_normalized.cpu().numpy())
+        unique_labels = np.unique(cluster_labels)
+        num_clusters = len(unique_labels)
 
-        # Apply the threshold to create the adjacency matrix for the current batch
-        adjacency_matrix_batch = (similarity_matrix >= threshold).float().cpu().numpy()
+    # Create a sparse matrix in COO format
+    row_indices = []
+    col_indices = []
+    data = []
 
-        # Update the sparse adjacency matrix in LIL format
-        adjacency_matrix[start_idx:end_idx, start_idx:end_idx] = adjacency_matrix_batch
+    if fallback_mode == "cluster":
+        for cluster_label in unique_labels:
+            cluster_mask = cluster_labels == cluster_label
+            cluster_embeddings = sdr_embeddings_normalized[cluster_mask]
 
-    # Convert the LIL matrix to CSR format for efficient storage and computation
-    adjacency_matrix = adjacency_matrix.tocsr()
+            for start_idx in range(0, cluster_embeddings.shape[0], batch_size):
+                end_idx = min(start_idx + batch_size, cluster_embeddings.shape[0])
+                batch_embeddings = cluster_embeddings[start_idx:end_idx]
 
-    yield adjacency_matrix
+                # Compute the similarity within the current batch using einsum
+                similarity_matrix = torch.einsum('ij,kj->ik', batch_embeddings, cluster_embeddings)
 
+                # Apply the threshold to create the adjacency matrix for the current batch
+                batch_adjacency_matrix = similarity_matrix >= threshold
 
-def compute_and_save_adjacency_matrix(
-    sdr_embeddings: torch.Tensor,
-    threshold: float = 0.5,
-    batch_size: int = 32,
-    output_file: str = "adjacency_matrix.npz",
-    device: torch.device = torch.device("cpu"),
-) -> None:
-    """
-    Compute the adjacency matrix from SDR embeddings using similarity and save it to a file.
-    Args:
-        sdr_embeddings (torch.Tensor): The SDR embeddings tensor.
-        threshold (float): The similarity threshold for considering two embeddings as neighbors.
-        batch_size (int): The batch size for computing the adjacency matrix.
-        output_file (str): The output file path to save the adjacency matrix.
-        device (torch.device): The device to use for tensor operations (e.g., torch.device("cuda") for GPU).
-    """
-    # Compute the adjacency matrix
-    adjacency_matrix_gen = adjacency_matrix_generator(
-        sdr_embeddings, threshold, batch_size, device
+                # Convert the batch adjacency matrix to COO format
+                batch_row_indices, batch_col_indices = torch.where(batch_adjacency_matrix)
+                batch_data = torch.ones(batch_row_indices.shape[0], dtype=torch.int8)
+
+                # Adjust the row and column indices based on the cluster and batch
+                batch_row_indices += start_idx
+                batch_col_indices = torch.tensor([np.where(cluster_mask)[0][i] for i in batch_col_indices])
+
+                # Append the batch indices and data to the overall adjacency matrix
+                row_indices.append(batch_row_indices.cpu().numpy())
+                col_indices.append(batch_col_indices.cpu().numpy())
+                data.append(batch_data.cpu().numpy())
+    else:
+        for start_idx in tqdm(range(0, num_embeddings, chunk_size), desc="Computing adjacency matrix"):
+            end_idx = min(start_idx + chunk_size, num_embeddings)
+            chunk_embeddings = sdr_embeddings_normalized[start_idx:end_idx]
+
+            for batch_start_idx in range(0, chunk_embeddings.shape[0], batch_size):
+                batch_end_idx = min(batch_start_idx + batch_size, chunk_embeddings.shape[0])
+                batch_embeddings = chunk_embeddings[batch_start_idx:batch_end_idx]
+
+                # Compute the similarity within the current batch using einsum
+                similarity_matrix = torch.einsum('ij,kj->ik', batch_embeddings, chunk_embeddings)
+
+                # Apply the threshold to create the adjacency matrix for the current batch
+                batch_adjacency_matrix = similarity_matrix >= threshold
+
+                # Convert the batch adjacency matrix to COO format
+                batch_row_indices, batch_col_indices = torch.where(batch_adjacency_matrix)
+                batch_data = torch.ones(batch_row_indices.shape[0], dtype=torch.int8)
+
+                # Adjust the row indices based on the current batch and chunk
+                batch_row_indices += batch_start_idx
+                batch_col_indices += start_idx
+
+                # Append the batch indices and data to the overall adjacency matrix
+                row_indices.append(batch_row_indices.cpu().numpy())
+                col_indices.append(batch_col_indices.cpu().numpy())
+                data.append(batch_data.cpu().numpy())
+
+    # Concatenate the row indices, column indices, and data
+    row_indices = np.concatenate(row_indices)
+    col_indices = np.concatenate(col_indices)
+    data = np.concatenate(data)
+
+    # Create a sparse matrix in CSR format
+    adjacency_matrix_sparse = csr_matrix(
+        (data, (row_indices, col_indices)),
+        shape=(num_embeddings, num_embeddings)
     )
-    adjacency_matrix = next(adjacency_matrix_gen)
 
     # Save the adjacency matrix to a file
-    save_npz(output_file, adjacency_matrix)
+    save_npz(output_file, adjacency_matrix_sparse)
     logger.info(f"Adjacency matrix saved to: {output_file}")
+
+    # Return the adjacency matrix and the original number of embeddings
+    return adjacency_matrix_sparse, num_embeddings
 
 
 def load_adjacency_matrix(file_path: str) -> csr_matrix:
@@ -217,7 +233,6 @@ def main(config_path: str) -> None:
     logger.info(
         f"Number of preprocessed conversations: {len(preprocessed_conversations)}"
     )
-    logger.debug(f"First preprocessed conversation: {preprocessed_conversations[0]}")
 
     # Flatten the preprocessed conversations
     preprocessed_conversations = [
@@ -247,32 +262,22 @@ def main(config_path: str) -> None:
     logger.info("Creating adjacency matrix...")
     device = torch.device(config["device"])
 
-    # Check if the adjacency matrix file exists
+    # Compute and save the adjacency matrix
+    logger.info("Computing and saving adjacency matrix...")
     adjacency_matrix_file = config["adjacency_matrix"]["output_file"]
-    if os.path.exists(adjacency_matrix_file):
-        # Load the adjacency matrix from file
-        logger.info("Loading adjacency matrix from file...")
-        adjacency_matrix = load_adjacency_matrix(adjacency_matrix_file)
-    else:
-        # Compute and save the adjacency matrix
-        logger.info("Computing and saving adjacency matrix...")
-        compute_and_save_adjacency_matrix(
-            sdr_embeddings,
-            threshold=config["adjacency_matrix"]["threshold"],
-            batch_size=config["adjacency_matrix"]["batch_size"],
-            output_file=adjacency_matrix_file,
-            device=device,
-        )
-        adjacency_matrix = load_adjacency_matrix(adjacency_matrix_file)
+    compute_and_save_adjacency_matrix(
+        sdr_embeddings,
+        threshold=config["adjacency_matrix"]["threshold"],
+        batch_size=config["adjacency_matrix"]["batch_size"],
+        output_file=adjacency_matrix_file,
+        device=device,
+    )
+    adjacency_matrix = load_adjacency_matrix(adjacency_matrix_file)
 
     tokenizer = BertTokenizer.from_pretrained(config["tokenizer"]["name"])
 
-    # Create a vocabulary dictionary from the preprocessed conversations
-    vocab = build_vocab(
-        preprocessed_conversations, max_vocab_size=preprocessor.max_vocab_size
-    )
     # Create dataset
-    dataset = SemanticFoldingDataset(sdr_embeddings, tokenizer, labels=None)
+    dataset = SemanticFoldingDataset(sdr_embeddings, tokenizer)
 
     # Perform k-fold cross-validation
     k = config.get("k_folds", 5)
@@ -309,10 +314,8 @@ def main(config_path: str) -> None:
             sp_params=config["sdr_params"],
             gat_params=config["gat_params"],
             htm_params=config["htm_params"],
-            device=device,
-            vocab=vocab,
-            tokenizer=tokenizer,
             snn_params=config["snn_params"],
+            device=device,
         ).to(device)
 
         if torch.cuda.device_count() > 1:
@@ -329,10 +332,6 @@ def main(config_path: str) -> None:
 
         logger.info(f"Training model for fold {fold + 1}...")
 
-        adjacency_matrix_batches = [
-            adjacency_matrix
-        ]  # Use the entire adjacency matrix as a single batch
-
         train_losses, val_losses = train(
             snn_model,
             train_dataloader,
@@ -340,7 +339,7 @@ def main(config_path: str) -> None:
             tokenizer,
             train_config,
             device,
-            adjacency_matrix_batches,
+            adjacency_matrix,  # Pass the SciPy sparse matrix
             writer,
             checkpoint_dir=".checkpoints",
         )
