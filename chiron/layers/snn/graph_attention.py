@@ -65,22 +65,33 @@ class GraphAttentionLayer(nn.Module):
             torch.Tensor: Attention scores of shape (batch_size, num_heads, seq_len, seq_len).
         """
         batch_size, seq_len, num_features = input_tensor.size()
-        logger.debug(f"Input tensor shape in _compute_attention_scores: {input_tensor.shape}")
+        logger.debug(
+            f"Input tensor shape in _compute_attention_scores: {input_tensor.shape}"
+        )
 
         # Reshape the input tensor to (batch_size, seq_len, num_heads, out_features_per_head)
         input_tensor = input_tensor.view(batch_size, seq_len, self.num_heads, -1)
-        logger.debug(f"Reshaped input tensor shape in _compute_attention_scores: {input_tensor.shape}")
+        logger.debug(
+            f"Reshaped input tensor shape in _compute_attention_scores: {input_tensor.shape}"
+        )
 
         # Compute the attention scores using the attention mechanism coefficient
         attn_scores = torch.einsum("bihk,bjhk->bhij", input_tensor, input_tensor)
-        logger.debug(f"Attention scores shape before activation in _compute_attention_scores: {attn_scores.shape}")
+        logger.debug(
+            f"Attention scores shape before activation in _compute_attention_scores: {attn_scores.shape}"
+        )
         attn_scores = self.leakyrelu(attn_scores)
-        logger.debug(f"Attention scores shape after activation in _compute_attention_scores: {attn_scores.shape}")
+        logger.debug(
+            f"Attention scores shape after activation in _compute_attention_scores: {attn_scores.shape}"
+        )
 
         return attn_scores
 
-    def forward(self, input_tensor: torch.Tensor,
-                adj_matrix: Union[np.ndarray, scipy.sparse.csr_matrix, torch.Tensor] = None) -> torch.Tensor:
+    def forward(
+        self,
+        input_tensor: torch.Tensor,
+        adj_matrix: Union[np.ndarray, scipy.sparse.csr_matrix, torch.Tensor] = None,
+    ) -> torch.Tensor:
         """
         Compute the output features for the input tensor.
 
@@ -105,7 +116,9 @@ class GraphAttentionLayer(nn.Module):
                 adj_matrix_tensor = torch.from_numpy(adj_matrix).to(input_tensor.device)
             elif isinstance(adj_matrix, scipy.sparse.csr_matrix):
                 # Convert the sparse adjacency matrix to a dense PyTorch tensor
-                adj_matrix_tensor = torch.from_numpy(adj_matrix.toarray()).to(input_tensor.device)
+                adj_matrix_tensor = torch.from_numpy(adj_matrix.toarray()).to(
+                    input_tensor.device
+                )
             elif isinstance(adj_matrix, torch.Tensor):
                 # Adjacency matrix is already a PyTorch tensor
                 adj_matrix_tensor = adj_matrix.to(input_tensor.device)
@@ -113,13 +126,13 @@ class GraphAttentionLayer(nn.Module):
                 raise TypeError(f"Unsupported type for adj_matrix: {type(adj_matrix)}")
 
             # Ensure the adjacency matrix tensor has the correct shape
-            assert adj_matrix_tensor.shape == (seq_len, seq_len), f"Adjacency matrix should have shape (seq_len, seq_len), but got {adj_matrix_tensor.shape}"
-
-            # Expand the adjacency matrix tensor to match the shape of attn_scores
-            adj_matrix_tensor = adj_matrix_tensor.unsqueeze(0).unsqueeze(0).expand(batch_size, self.num_heads, seq_len, seq_len)
+            assert adj_matrix_tensor.shape == (
+                seq_len,
+                seq_len,
+            ), f"Adjacency matrix should have shape (seq_len, seq_len), but got {adj_matrix_tensor.shape}"
 
             # Mask the attention scores with the adjacency matrix
-            attn_scores = attn_scores.masked_fill(adj_matrix_tensor == 0, float('-inf'))
+            attn_scores = attn_scores.masked_fill(adj_matrix_tensor == 0, float("-inf"))
 
         # Apply softmax to normalize the attention scores
         attn_probs = nn.functional.softmax(attn_scores, dim=-1)

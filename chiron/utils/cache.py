@@ -6,7 +6,9 @@ import pandas as pd
 from loguru import logger
 
 
-def cache_data(data: Union[pd.DataFrame, pd.Series, np.ndarray, list, dict], filepath: str) -> None:
+def cache_data(
+    data: Union[pd.DataFrame, pd.Series, np.ndarray, list, dict], filepath: str
+) -> None:
     return
     """
     Cache data to a Feather file.

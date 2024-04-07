@@ -7,6 +7,8 @@ import torch
 from loguru import logger
 from torch import nn
 
+# ...
+
 
 class HTMSpatialPooler:
     def __init__(
@@ -134,11 +136,11 @@ class HTMSpatialPooler:
             np.ndarray: The overlap scores for each minicolumn.
         """
         overlap = np.zeros(self.num_minicolumns)
-        input_vector = input_vector.reshape(input_vector.shape[0], -1)
+        input_vector = input_vector.reshape(
+            -1, self.input_size
+        )  # Reshape input_vector to 2D
         for i in range(self.num_minicolumns):
-            connected_synapses = self.connections[i][: input_vector.shape[1]].astype(
-                bool
-            )  # noqa: E501
+            connected_synapses = self.connections[i].astype(bool)
             overlap[i] = np.sum(input_vector[:, connected_synapses], axis=1).sum()
         return overlap
 
@@ -314,27 +316,28 @@ class HTMModel(nn.Module):
             device
         )  # Adjust the input size of the fully connected layer
 
-    def forward(self, input_sequence: List[torch.Tensor]) -> torch.Tensor:
+    def forward(self, input_sequence: torch.Tensor) -> torch.Tensor:
         """
         Process the input sequence using the HTM model.
 
         Args:
-            input_sequence (List[torch.Tensor]): The sequence of input vectors.
+            input_sequence (torch.Tensor): The sequence of input vectors.
 
         Returns:
             torch.Tensor: The sequence of active columns.
         """
+        device = input_sequence.device
+        batch_size, seq_len, _ = input_sequence.shape
+
         active_columns_sequence = []
-        for input_vector in input_sequence:
+        for t in range(seq_len):
+            input_vector = input_sequence[:, t, :].cpu().numpy()
             active_columns = self.spatial_pooler.forward(input_vector)
             active_columns_sequence.append(active_columns)
-        active_columns_tensor = torch.stack(active_columns_sequence).to(
-            self.device
-        )  # Move the tensor to the specified device
+
+        active_columns_tensor = torch.stack(active_columns_sequence, dim=1).to(device)
         logger.debug(
-            f"""
-           performing htm forward pass on input sequence of length {len(input_sequence)}
-           """
+            f"performing htm forward pass on input sequence of shape {input_sequence.shape}"
         )
         logger.debug(self.inspect())
         output = self.fc(active_columns_tensor)  # Apply the fully connected layer

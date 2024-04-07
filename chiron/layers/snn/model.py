@@ -1,18 +1,7 @@
 # chiron/layers/snn/model.py
 
-from typing import List
-
-import torch
-import torch.nn as nn
-from loguru import logger
-
-from chiron.layers.htm.model import HTMModel
-from chiron.layers.snn.graph_attention import GraphAttentionLayer
-
 
 # chiron/layers/snn/model.py
-
-from typing import List
 
 import torch
 import torch.nn as nn
@@ -24,12 +13,12 @@ from chiron.layers.snn.graph_attention import GraphAttentionLayer
 
 class SNNModel(nn.Module):
     def __init__(
-            self,
-            sp_params: dict,
-            gat_params: dict,
-            htm_params: dict,
-            snn_params: dict,
-            device: torch.device,
+        self,
+        sp_params: dict,
+        gat_params: dict,
+        htm_params: dict,
+        snn_params: dict,
+        device: torch.device,
     ):
         """
         Initialize the SNNModel.
@@ -77,9 +66,9 @@ class SNNModel(nn.Module):
                 self.output_size,
             ).to(device)
         else:
-            self.fc_out = nn.Linear(
-                gat_params["out_features"], self.output_size
-            ).to(device)
+            self.fc_out = nn.Linear(gat_params["out_features"], self.output_size).to(
+                device
+            )
 
         logger.info(
             f"SNNModel initialized with sp_params={sp_params}, gat_params={gat_params},"
@@ -87,11 +76,11 @@ class SNNModel(nn.Module):
         )
 
     def forward(
-            self,
-            input_ids: torch.Tensor,
-            attention_mask: torch.Tensor,
-            adjacency_matrix: torch.Tensor,
-            node_indices: torch.Tensor,
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        adjacency_matrix: torch.Tensor,
+        node_indices: torch.Tensor,
     ) -> torch.Tensor:
         """
         Perform the forward pass of the SNN model.
@@ -121,11 +110,17 @@ class SNNModel(nn.Module):
         snn_output = snn_output.view(batch_size, seq_len, timesteps * snn_output_size)
 
         # Apply attention mask to the SNN output
-        attention_mask_expanded = attention_mask.unsqueeze(-1).expand(batch_size, seq_len, timesteps * snn_output_size)
+        attention_mask_expanded = attention_mask.unsqueeze(-1).expand(
+            batch_size, seq_len, timesteps * snn_output_size
+        )
         snn_output = snn_output * attention_mask_expanded
 
         # Apply the GAT layer
-        gat_output = self.gat_layer(snn_output, adjacency_matrix)
+        seq_len = snn_output.size(1)
+        adj_matrix_tensor = adjacency_matrix[
+            :seq_len, :seq_len
+        ]  # Slice the adjacency matrix to match the sequence length
+        gat_output = self.gat_layer(snn_output, adj_matrix_tensor)
         logger.debug(f"GAT output shape: {gat_output.shape}")
 
         # Apply the HTM layer
@@ -133,7 +128,11 @@ class SNNModel(nn.Module):
         logger.debug(f"HTM output shape: {htm_output.shape}")
 
         # Apply node indices to the HTM output
-        node_indices_expanded = node_indices.unsqueeze(-1).unsqueeze(-1).expand(batch_size, 1, htm_output.size(-1))
+        node_indices_expanded = (
+            node_indices.unsqueeze(-1)
+            .unsqueeze(-1)
+            .expand(batch_size, 1, htm_output.size(-1))
+        )
         htm_output_selected = torch.gather(htm_output, 1, node_indices_expanded)
         htm_output_selected = htm_output_selected.squeeze(1)
 
@@ -144,18 +143,18 @@ class SNNModel(nn.Module):
         return output
 
     def generate(
-            self,
-            input_conversation: list,
-            adjacency_matrix: torch.Tensor,
-            node_indices: torch.Tensor,
-            max_length: int = 100,
-            num_return_sequences: int = 1,
-            temperature: float = 0.7,
-            top_k: int = 50,
-            top_p: float = 0.9,
-            mirostat_eta: float = 0.1,
-            mirostat_tau: float = 5.0,
-            **_,
+        self,
+        input_conversation: list,
+        adjacency_matrix: torch.Tensor,
+        node_indices: torch.Tensor,
+        max_length: int = 100,
+        num_return_sequences: int = 1,
+        temperature: float = 0.7,
+        top_k: int = 50,
+        top_p: float = 0.9,
+        mirostat_eta: float = 0.1,
+        mirostat_tau: float = 5.0,
+        **_,
     ) -> list:
         """
         Generate responses based on the input conversation.
@@ -200,29 +199,48 @@ class SNNModel(nn.Module):
             mirostat_s = 1.0
 
             # Tokenize the input conversation
-            input_ids = self.tokenizer.encode(input_text, return_tensors="pt").to(self.device)
-            attention_mask = torch.ones_like(input_ids, dtype=torch.long).to(self.device)
+            input_ids = self.tokenizer.encode(input_text, return_tensors="pt").to(
+                self.device
+            )
+            attention_mask = torch.ones_like(input_ids, dtype=torch.long).to(
+                self.device
+            )
 
             response = []
             while len(response) < max_length:
                 # Forward pass
                 if adjacency_matrix is None or node_indices is None:
                     # If adjacency_matrix or node_indices are not provided, create dummy values
-                    dummy_adj_matrix = torch.eye(input_ids.size(-1), dtype=torch.bool).to(self.device)
-                    dummy_node_indices = torch.zeros(1, dtype=torch.long).to(self.device)
-                    output = self.forward(input_ids, attention_mask, [dummy_adj_matrix], dummy_node_indices)
+                    dummy_adj_matrix = torch.eye(
+                        input_ids.size(-1), dtype=torch.bool
+                    ).to(self.device)
+                    dummy_node_indices = torch.zeros(1, dtype=torch.long).to(
+                        self.device
+                    )
+                    output = self.forward(
+                        input_ids,
+                        attention_mask,
+                        [dummy_adj_matrix],
+                        dummy_node_indices,
+                    )
                 else:
-                    output = self.forward(input_ids, attention_mask, [adjacency_matrix], node_indices)
+                    output = self.forward(
+                        input_ids, attention_mask, [adjacency_matrix], node_indices
+                    )
 
                 # Sample from the model's output distribution
                 output_logits = output[:, -1, :] / temperature
-                filtered_logits = self._top_k_top_p_filtering(output_logits, top_k=top_k, top_p=top_p)
+                filtered_logits = self._top_k_top_p_filtering(
+                    output_logits, top_k=top_k, top_p=top_p
+                )
                 probabilities = torch.softmax(filtered_logits, dim=-1)
                 next_token = torch.multinomial(probabilities, num_samples=1)
 
                 # Update Mirostat parameters
-                mirostat_s = mirostat_eta * (output_logits.max().item() - mirostat_tau) + (
-                        1 - mirostat_eta) * mirostat_s
+                mirostat_s = (
+                    mirostat_eta * (output_logits.max().item() - mirostat_tau)
+                    + (1 - mirostat_eta) * mirostat_s
+                )
                 mirostat_mu = mirostat_mu * torch.exp(mirostat_s)
                 temperature = max(0.1, temperature * (mirostat_tau / mirostat_mu))
 
@@ -232,8 +250,13 @@ class SNNModel(nn.Module):
 
                 response.append(next_token.item())
                 input_ids = torch.cat([input_ids, next_token], dim=-1)
-                attention_mask = torch.cat([attention_mask, torch.tensor([1], device=self.device, dtype=torch.long)],
-                                           dim=-1)
+                attention_mask = torch.cat(
+                    [
+                        attention_mask,
+                        torch.tensor([1], device=self.device, dtype=torch.long),
+                    ],
+                    dim=-1,
+                )
 
             # Add the generated response to the conversation
             generated_response = self.tokenizer.decode(response)
@@ -243,7 +266,9 @@ class SNNModel(nn.Module):
         return generated_conversations
 
     @classmethod
-    def _top_k_top_p_filtering(cls, logits: torch.Tensor, top_k: int = 50, top_p: float = 0.9) -> torch.Tensor:
+    def _top_k_top_p_filtering(
+        cls, logits: torch.Tensor, top_k: int = 50, top_p: float = 0.9
+    ) -> torch.Tensor:
         """
         Apply top-k and top-p filtering to the logits tensor.
 
@@ -262,7 +287,9 @@ class SNNModel(nn.Module):
         top_p_logits = top_k_logits.clone()
         top_p_logits.fill_(-float("inf"))
         sorted_indices = top_k_indices.argsort(dim=-1, descending=True)
-        cumulative_probs = torch.cumsum(torch.softmax(top_k_logits, dim=-1)[0, sorted_indices[0]], dim=-1)
+        cumulative_probs = torch.cumsum(
+            torch.softmax(top_k_logits, dim=-1)[0, sorted_indices[0]], dim=-1
+        )
         top_p_indices = torch.where(cumulative_probs <= top_p)[0]
         if top_p_indices.size(0) > 0:
             top_p_indices = sorted_indices[0, : top_p_indices[-1] + 1]
@@ -273,12 +300,12 @@ class SNNModel(nn.Module):
 
 class SNNLayer(nn.Module):
     def __init__(
-            self,
-            input_size: int,
-            hidden_size: int,
-            output_size: int,
-            timesteps: int,
-            dropout: float = 0.0,
+        self,
+        input_size: int,
+        hidden_size: int,
+        output_size: int,
+        timesteps: int,
+        dropout: float = 0.0,
     ):
         """
         Initialize the SNNLayer.
@@ -316,8 +343,9 @@ class SNNLayer(nn.Module):
         x = x.view(batch_size * seq_len, input_size)
 
         # Ensure the input tensor has the same number of features as the linear layer expects
-        assert x.size(
-            1) == self.fc1.in_features, f"Expected input tensor to have {self.fc1.in_features} features, but got {x.size(1)}"
+        assert (
+            x.size(1) == self.fc1.in_features
+        ), f"Expected input tensor to have {self.fc1.in_features} features, but got {x.size(1)}"
 
         # Convert the input tensor to the same dtype as the linear layer weights
         x = x.to(dtype=self.fc1.weight.dtype)

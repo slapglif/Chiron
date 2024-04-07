@@ -1,7 +1,8 @@
 import os
-from typing import List, Tuple
+from typing import List, Tuple, Union
 
 import safetensors
+import scipy
 import torch
 import torch.nn as nn
 from loguru import logger
@@ -15,8 +16,9 @@ from chiron.evaluation.metrics import evaluate_text_prediction
 from chiron.layers.snn.model import SNNModel
 
 
-def collate_fn(batch: List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]]) -> Tuple[
-    torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+def collate_fn(
+    batch: List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]]
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Custom collate function to handle variable-length sequences in a batch.
 
@@ -31,7 +33,9 @@ def collate_fn(batch: List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]]
 
     # Pad input_ids and attention_mask
     padded_input_ids = pad_sequence(input_ids, batch_first=True, padding_value=0)
-    padded_attention_mask = pad_sequence(attention_mask, batch_first=True, padding_value=0)
+    padded_attention_mask = pad_sequence(
+        attention_mask, batch_first=True, padding_value=0
+    )
 
     # Stack labels instead of padding
     stacked_labels = torch.stack(labels)
@@ -87,17 +91,17 @@ def load_checkpoint(checkpoint_path, model, optimizer, scheduler):
 
 
 def train(
-        model: SNNModel,
-        train_dataloader: torch.utils.data.DataLoader,
-        val_dataloader: torch.utils.data.DataLoader,
-        tokenizer: PreTrainedTokenizer,
-        config: dict,
-        device: torch.device,
-        adjacency_matrix_batches: List[torch.Tensor],
-        writer: SummaryWriter,
-        checkpoint_dir: str = ".checkpoints",
-        resume_from_latest: bool = True,
-        model_name: str = "snn_model",
+    model: SNNModel,
+    train_dataloader: torch.utils.data.DataLoader,
+    val_dataloader: torch.utils.data.DataLoader,
+    tokenizer: PreTrainedTokenizer,
+    config: dict,
+    device: torch.device,
+    adjacency_matrix: Union[scipy.sparse.csr_matrix, torch.Tensor],
+    writer: SummaryWriter,
+    checkpoint_dir: str = ".checkpoints",
+    resume_from_latest: bool = True,
+    model_name: str = "snn_model",
 ) -> Tuple[List[float], List[float]]:
     """
     Train the SNNModel on the given datasets.
@@ -109,7 +113,7 @@ def train(
         tokenizer (PreTrainedTokenizer): The tokenizer for the language model.
         config (dict): The training configuration.
         device (torch.device): The device to run the training on.
-        adjacency_matrix_batches (List[torch.Tensor]): List of batch adjacency matrix tensors.
+        adjacency_matrix (Union[scipy.sparse.csr_matrix, torch.Tensor]): The adjacency matrix as a SciPy sparse matrix or a PyTorch tensor.
         writer (SummaryWriter): The TensorBoard writer for logging.
         checkpoint_dir (str): The directory to save checkpoints.
         resume_from_latest (bool): Whether to resume training from the latest checkpoint.
@@ -133,11 +137,19 @@ def train(
             reverse=True,
         )
         if latest_checkpoint_files:
-            latest_checkpoint_path = os.path.join(checkpoint_dir, latest_checkpoint_files[0])
-            start_epoch = load_checkpoint(latest_checkpoint_path, model, optimizer, scheduler)
-            logger.info(f"Resuming training from the latest checkpoint: {latest_checkpoint_path}")
+            latest_checkpoint_path = os.path.join(
+                checkpoint_dir, latest_checkpoint_files[0]
+            )
+            start_epoch = load_checkpoint(
+                latest_checkpoint_path, model, optimizer, scheduler
+            )
+            logger.info(
+                f"Resuming training from the latest checkpoint: {latest_checkpoint_path}"
+            )
         else:
-            logger.info("No previous checkpoints found. Starting training from scratch.")
+            logger.info(
+                "No previous checkpoints found. Starting training from scratch."
+            )
 
     best_val_loss = float("inf")
     patience_counter = 0
@@ -160,7 +172,9 @@ def train(
         # Zero the gradients
         optimizer.zero_grad()
 
-        for batch_idx, batch in enumerate(tqdm(train_dataloader, desc="Train"), start=1):
+        for batch_idx, batch in enumerate(
+            tqdm(train_dataloader, desc="Train"), start=1
+        ):
             # Get the input tensors and labels
             input_ids, attention_mask, labels, node_indices = batch
             input_ids = input_ids.to(device)
@@ -168,16 +182,32 @@ def train(
             labels = labels.to(device)
             node_indices = node_indices.to(device)
 
+            # Convert the adjacency matrix to a dense PyTorch tensor if necessary
+            if isinstance(adjacency_matrix, scipy.sparse.csr_matrix):
+                adj_matrix_tensor = torch.tensor(
+                    adjacency_matrix.toarray(), dtype=torch.float32, device=device
+                )
+            else:
+                adj_matrix_tensor = adjacency_matrix.to(device)
+
             # Mixed-precision training
             with torch.cuda.amp.autocast():
                 # Forward pass
-                outputs = model(input_ids, attention_mask, adjacency_matrix_batches, node_indices)
+                outputs = model(
+                    input_ids,
+                    attention_mask,
+                    adj_matrix_tensor,
+                    node_indices,
+                )
 
                 # Compute the loss
                 losses = []
-                for i in range(outputs.size(1)):  # Iterate over the sequence length dimension
-                    loss = criterion(outputs[:, i, :],
-                                     labels[:, i, :])  # Use the correct dimensions for outputs and labels
+                for i in range(
+                    outputs.size(1)
+                ):  # Iterate over the sequence length dimension
+                    loss = criterion(
+                        outputs[:, i, :], labels[:, i, :]
+                    )  # Use the correct dimensions for outputs and labels
                     losses.append(loss)
 
                 loss = torch.stack(losses).mean()  # Take the mean of the losses
@@ -205,11 +235,13 @@ def train(
         train_losses.append(train_loss)
 
         # Evaluate on the validation set
-        val_loss = evaluate(model, val_dataloader, tokenizer, device, adjacency_matrix_batches)
+        val_loss = evaluate(model, val_dataloader, tokenizer, device, adjacency_matrix)
         val_losses.append(val_loss)
 
         # Save the model as a SafeTensor
-        safetensors.torch.save_file(model.state_dict(), f"{model_name}_epoch_{epoch}.safetensors")
+        safetensors.torch.save_file(
+            model.state_dict(), f"{model_name}_epoch_{epoch}.safetensors"
+        )
 
         # Save the checkpoint
         save_checkpoint(epoch, model, optimizer, scheduler, checkpoint_dir, model_name)
@@ -231,7 +263,9 @@ def train(
                 logger.info(f"Early stopping after {epoch} epochs.")
                 break
 
-        logger.info(f"Epoch {epoch}/{config['num_epochs']}: Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}")
+        logger.info(
+            f"Epoch {epoch}/{config['num_epochs']}: Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}"
+        )
 
     # Save the final model as a SafeTensor
     safetensors.torch.save_file(model.state_dict(), f"{model_name}_final.safetensors")
@@ -240,11 +274,11 @@ def train(
 
 
 def evaluate(
-        model: SNNModel,
-        dataloader: DataLoader,
-        tokenizer: PreTrainedTokenizer,
-        device: torch.device,
-        adjacency_matrix_batches: List[torch.Tensor],
+    model: SNNModel,
+    dataloader: DataLoader,
+    tokenizer: PreTrainedTokenizer,
+    device: torch.device,
+    adjacency_matrix_batches: List[torch.Tensor],
 ) -> float:
     """
     Evaluate the model on the given dataset.
@@ -273,12 +307,18 @@ def evaluate(
             node_indices = node_indices.to(device)
 
             # Forward pass
-            outputs = model(input_ids, attention_mask, adjacency_matrix_batches, node_indices)
+            outputs = model(
+                input_ids, attention_mask, adjacency_matrix_batches, node_indices
+            )
 
             # Compute the loss
             losses = []
-            for i in range(outputs.size(1)):  # Iterate over the sequence length dimension
-                loss = criterion(outputs[:, i, :], labels[:, i, :])  # Use the correct dimensions for outputs and labels
+            for i in range(
+                outputs.size(1)
+            ):  # Iterate over the sequence length dimension
+                loss = criterion(
+                    outputs[:, i, :], labels[:, i, :]
+                )  # Use the correct dimensions for outputs and labels
                 losses.append(loss)
 
             loss = torch.stack(losses).mean()  # Take the mean of the losses

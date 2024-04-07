@@ -54,17 +54,17 @@ import numpy as np
 
 
 def compute_and_save_adjacency_matrix(
-        sdr_embeddings: torch.Tensor,
-        threshold: float = 0.5,
-        batch_size: int = 256,
-        output_file: str = "adjacency_matrix.npz",
-        device: torch.device = torch.device("cuda:0"),
-        fallback_mode: str = "subsample",
-        subsample_ratio: float = 0.01,
-        num_clusters: int = 100,
-        eps: float = 0.5,
-        min_samples: int = 10,
-        chunk_size: int = 10000,
+    sdr_embeddings: torch.Tensor,
+    threshold: float = 0.5,
+    batch_size: int = 256,
+    output_file: str = "adjacency_matrix.npz",
+    device: torch.device = torch.device("cuda:0"),
+    fallback_mode: str = "subsample",
+    subsample_ratio: float = 0.01,
+    num_clusters: int = 100,
+    eps: float = 0.5,
+    min_samples: int = 10,
+    chunk_size: int = 10000,
 ) -> None:
     # Move the SDR embeddings tensor to the specified device
     sdr_embeddings = sdr_embeddings.to(device)
@@ -79,7 +79,9 @@ def compute_and_save_adjacency_matrix(
     if fallback_mode == "subsample":
         # Perform subsampling
         subsample_size = int(num_embeddings * subsample_ratio)
-        subsample_indices = np.random.choice(num_embeddings, size=subsample_size, replace=False)
+        subsample_indices = np.random.choice(
+            num_embeddings, size=subsample_size, replace=False
+        )
         sdr_embeddings_normalized = sdr_embeddings_normalized[subsample_indices]
         num_embeddings = subsample_size
     elif fallback_mode == "cluster":
@@ -88,7 +90,9 @@ def compute_and_save_adjacency_matrix(
             clustering_model = KMeans(n_clusters=num_clusters, random_state=42)
         else:
             clustering_model = DBSCAN(eps=eps, min_samples=min_samples, n_jobs=-1)
-        cluster_labels = clustering_model.fit_predict(sdr_embeddings_normalized.cpu().numpy())
+        cluster_labels = clustering_model.fit_predict(
+            sdr_embeddings_normalized.cpu().numpy()
+        )
         unique_labels = np.unique(cluster_labels)
         num_clusters = len(unique_labels)
 
@@ -107,40 +111,54 @@ def compute_and_save_adjacency_matrix(
                 batch_embeddings = cluster_embeddings[start_idx:end_idx]
 
                 # Compute the similarity within the current batch using einsum
-                similarity_matrix = torch.einsum('ij,kj->ik', batch_embeddings, cluster_embeddings)
+                similarity_matrix = torch.einsum(
+                    "ij,kj->ik", batch_embeddings, cluster_embeddings
+                )
 
                 # Apply the threshold to create the adjacency matrix for the current batch
                 batch_adjacency_matrix = similarity_matrix >= threshold
 
                 # Convert the batch adjacency matrix to COO format
-                batch_row_indices, batch_col_indices = torch.where(batch_adjacency_matrix)
+                batch_row_indices, batch_col_indices = torch.where(
+                    batch_adjacency_matrix
+                )
                 batch_data = torch.ones(batch_row_indices.shape[0], dtype=torch.int8)
 
                 # Adjust the row and column indices based on the cluster and batch
                 batch_row_indices += start_idx
-                batch_col_indices = torch.tensor([np.where(cluster_mask)[0][i] for i in batch_col_indices])
+                batch_col_indices = torch.tensor(
+                    [np.where(cluster_mask)[0][i] for i in batch_col_indices]
+                )
 
                 # Append the batch indices and data to the overall adjacency matrix
                 row_indices.append(batch_row_indices.cpu().numpy())
                 col_indices.append(batch_col_indices.cpu().numpy())
                 data.append(batch_data.cpu().numpy())
     else:
-        for start_idx in tqdm(range(0, num_embeddings, chunk_size), desc="Computing adjacency matrix"):
+        for start_idx in tqdm(
+            range(0, num_embeddings, chunk_size), desc="Computing adjacency matrix"
+        ):
             end_idx = min(start_idx + chunk_size, num_embeddings)
             chunk_embeddings = sdr_embeddings_normalized[start_idx:end_idx]
 
             for batch_start_idx in range(0, chunk_embeddings.shape[0], batch_size):
-                batch_end_idx = min(batch_start_idx + batch_size, chunk_embeddings.shape[0])
+                batch_end_idx = min(
+                    batch_start_idx + batch_size, chunk_embeddings.shape[0]
+                )
                 batch_embeddings = chunk_embeddings[batch_start_idx:batch_end_idx]
 
                 # Compute the similarity within the current batch using einsum
-                similarity_matrix = torch.einsum('ij,kj->ik', batch_embeddings, chunk_embeddings)
+                similarity_matrix = torch.einsum(
+                    "ij,kj->ik", batch_embeddings, chunk_embeddings
+                )
 
                 # Apply the threshold to create the adjacency matrix for the current batch
                 batch_adjacency_matrix = similarity_matrix >= threshold
 
                 # Convert the batch adjacency matrix to COO format
-                batch_row_indices, batch_col_indices = torch.where(batch_adjacency_matrix)
+                batch_row_indices, batch_col_indices = torch.where(
+                    batch_adjacency_matrix
+                )
                 batch_data = torch.ones(batch_row_indices.shape[0], dtype=torch.int8)
 
                 # Adjust the row indices based on the current batch and chunk
@@ -159,8 +177,7 @@ def compute_and_save_adjacency_matrix(
 
     # Create a sparse matrix in CSR format
     adjacency_matrix_sparse = csr_matrix(
-        (data, (row_indices, col_indices)),
-        shape=(num_embeddings, num_embeddings)
+        (data, (row_indices, col_indices)), shape=(num_embeddings, num_embeddings)
     )
 
     # Save the adjacency matrix to a file
@@ -339,7 +356,7 @@ def main(config_path: str) -> None:
             tokenizer,
             train_config,
             device,
-            adjacency_matrix,  # Pass the SciPy sparse matrix
+            adjacency_matrix,  # Pass the SciPy sparse matrix directly
             writer,
             checkpoint_dir=".checkpoints",
         )
