@@ -1,13 +1,11 @@
-# htm/model.py
+# chiron/layers/htm/model.py
 
-from typing import List
+from typing import Union, Tuple
 
 import numpy as np
 import torch
 from loguru import logger
 from torch import nn
-
-# ...
 
 
 class HTMSpatialPooler:
@@ -49,15 +47,9 @@ class HTMSpatialPooler:
             max_boost (float): The maximum boost value.
             seed (int): The random seed.
         """
-        self.inhibition_radius = None
-        self.min_overlap_duty_cycles = None
-        self.overlap_duty_cycles = None
-        self.permanences = None
-        self.active_duty_cycles = None
-        self.boosting_factors = None
-        self.connections = None
         self.input_size = input_size
         self.minicolumn_size = minicolumn_size
+        self.num_minicolumns = (input_size + minicolumn_size - 1) // minicolumn_size
         self.potential_radius = potential_radius
         self.potential_pct = potential_pct
         self.global_inhibition = global_inhibition
@@ -74,74 +66,56 @@ class HTMSpatialPooler:
         self.max_boost = max_boost
         self.seed = seed
 
-        self.num_minicolumns = self.input_size // self.minicolumn_size
-        self.minicolumn_dimensions = (self.num_minicolumns,)
-        self.input_dimensions = (self.input_size,)
-
-        self.initialize_connections()
-        self.initialize_boosting()
-
-    def initialize_connections(self) -> None:
-        """
-        Initialize the connections of the spatial pooler.
-        """
-        np.random.seed(self.seed)
+        # Initialize the connections and permanence matrices
         self.connections = np.random.rand(self.num_minicolumns, self.input_size)
         self.connections[self.connections < self.syn_perm_connected] = 0
         self.connections[self.connections >= self.syn_perm_connected] = 1
 
         self.permanences = np.zeros((self.num_minicolumns, self.input_size))
-        for i in range(self.num_minicolumns):
-            potential_indices = self.choose_potential_connections(i)
-            self.permanences[i, potential_indices] = np.random.rand(
-                len(potential_indices)
-            )
 
-    def initialize_boosting(self) -> None:
-        """
-        Initialize the boosting parameters of the spatial pooler.
-        """
-        self.boosting_factors = np.ones(self.num_minicolumns)
+        # Initialize the duty cycles and boosting factors
         self.active_duty_cycles = np.zeros(self.num_minicolumns)
         self.overlap_duty_cycles = np.zeros(self.num_minicolumns)
         self.min_overlap_duty_cycles = np.zeros(self.num_minicolumns)
+        self.boosting_factors = np.ones(self.num_minicolumns)
 
-    def choose_potential_connections(self, minicolumn_index: int) -> np.ndarray:
+    def compute_overlap(
+        self, input_vector: Union[np.ndarray, torch.Tensor]
+    ) -> Union[np.ndarray, torch.Tensor]:
         """
-        Choose the potential connections for a given minicolumn.
+        Compute the overlap between the input vector and the minicolumn connections using einsum.
 
         Args:
-            minicolumn_index (int): The index of the minicolumn.
+            input_vector (Union[np.ndarray, torch.Tensor]): The input vector of shape (batch_size, seq_len, input_size) or (batch_size * seq_len, input_size).
 
         Returns:
-            np.ndarray: The indices of the potential connections.
+            Union[np.ndarray, torch.Tensor]: The overlap scores for each minicolumn of shape (batch_size, seq_len, num_minicolumns) or (batch_size * seq_len, num_minicolumns).
         """
-        center = minicolumn_index * self.minicolumn_size + self.minicolumn_size // 2
-        radius = self.potential_radius
-        start = max(0, center - radius)
-        end = min(self.input_size, center + radius + 1)
-        indices = np.arange(start, end)
-        np.random.shuffle(indices)
-        num_potential = int(len(indices) * self.potential_pct)
-        return indices[:num_potential]
+        if isinstance(input_vector, torch.Tensor):
+            input_vector = input_vector.cpu().numpy()
 
-    def compute_overlap(self, input_vector: np.ndarray) -> np.ndarray:
-        """
-        Compute the overlap between the input vector and the minicolumn connections.
+        input_shape = input_vector.shape
+        if len(input_shape) == 3:
+            batch_size, seq_len, input_size = input_shape
+            input_vector = input_vector.reshape(batch_size * seq_len, input_size)
+        elif len(input_shape) == 2:
+            batch_size_seq_len, input_size = input_shape
+        else:
+            raise ValueError(f"Invalid input shape: {input_shape}")
 
-        Args:
-            input_vector (np.ndarray): The input vector.
+        # Ensure the connections matrix has the correct shape
+        assert self.connections.shape == (
+            self.num_minicolumns,
+            input_size,
+        ), f"Connections matrix shape {self.connections.shape} does not match expected shape ({self.num_minicolumns}, {input_size})"
 
-        Returns:
-            np.ndarray: The overlap scores for each minicolumn.
-        """
-        overlap = np.zeros(self.num_minicolumns)
-        input_vector = input_vector.reshape(
-            -1, self.input_size
-        )  # Reshape input_vector to 2D
-        for i in range(self.num_minicolumns):
-            connected_synapses = self.connections[i].astype(bool)
-            overlap[i] = np.sum(input_vector[:, connected_synapses], axis=1).sum()
+        overlap = np.einsum("ij,kj->ik", input_vector, self.connections)
+
+        if len(input_shape) == 3:
+            overlap = overlap.reshape(batch_size, seq_len, self.num_minicolumns)
+        else:
+            overlap = overlap.reshape(batch_size_seq_len, self.num_minicolumns)
+
         return overlap
 
     def inhibit_columns(self, overlap: np.ndarray) -> np.ndarray:
@@ -149,63 +123,33 @@ class HTMSpatialPooler:
         Perform inhibition on the minicolumns based on the overlap scores.
 
         Args:
-            overlap (np.ndarray): The overlap scores for each minicolumn.
+            overlap (np.ndarray): The overlap scores for each minicolumn of shape (batch_size, seq_len, num_minicolumns) or (batch_size * seq_len, num_minicolumns).
 
         Returns:
-            np.ndarray: The active columns after inhibition.
+            np.ndarray: The active columns after inhibition of shape (batch_size, seq_len, num_minicolumns) or (batch_size * seq_len, num_minicolumns).
         """
-        if self.global_inhibition:
-            return self.global_inhibition_func(overlap)
+        input_shape = overlap.shape
+        if len(input_shape) == 3:
+            batch_size, seq_len, _ = input_shape
+            active_columns = np.zeros(
+                (batch_size, seq_len, self.num_minicolumns), dtype=bool
+            )
         else:
-            return self.local_inhibition_func(overlap)
+            batch_size_seq_len, _ = input_shape
+            active_columns = np.zeros(
+                (batch_size_seq_len, self.num_minicolumns), dtype=bool
+            )
 
-    def global_inhibition_func(self, overlap: np.ndarray) -> np.ndarray:
-        """
-        Perform global inhibition on the minicolumns.
+        if self.global_inhibition:
+            num_active = np.minimum(
+                self.num_active_columns_per_inhibition_area, self.num_minicolumns
+            )
+            thresholds = np.partition(overlap, -num_active, axis=-1)[:, -num_active]
+            active_columns = overlap >= thresholds[:, np.newaxis]
+        else:
+            raise NotImplementedError("Local inhibition is not implemented.")
 
-        Args:
-            overlap (np.ndarray): The overlap scores for each minicolumn.
-
-        Returns:
-            np.ndarray: The active columns after global inhibition.
-        """
-        winners = np.argsort(overlap)[-self.num_active_columns_per_inhibition_area :]
-        active_columns = np.zeros(self.num_minicolumns)
-        active_columns[winners] = 1
         return active_columns
-
-    def local_inhibition_func(self, overlap: np.ndarray) -> np.ndarray:
-        """
-        Perform local inhibition on the minicolumns.
-
-        Args:
-            overlap (np.ndarray): The overlap scores for each minicolumn.
-
-        Returns:
-            np.ndarray: The active columns after local inhibition.
-        """
-        active_columns = np.zeros(self.num_minicolumns)
-        for i in range(self.num_minicolumns):
-            neighborhood = self.get_neighborhood(i)
-            neighborhood_overlap = overlap[neighborhood]
-            max_overlap = np.max(neighborhood_overlap)
-            if overlap[i] >= max_overlap:
-                active_columns[i] = 1
-        return active_columns
-
-    def get_neighborhood(self, minicolumn_index: int) -> np.ndarray:
-        """
-        Get the neighborhood of a given minicolumn.
-
-        Args:
-            minicolumn_index (int): The index of the minicolumn.
-
-        Returns:
-            np.ndarray: The indices of the minicolumns in the neighborhood.
-        """
-        start = max(0, minicolumn_index - self.inhibition_radius)
-        end = min(self.num_minicolumns, minicolumn_index + self.inhibition_radius + 1)
-        return np.arange(start, end)
 
     def update_permanences(
         self, active_columns: np.ndarray, input_vector: np.ndarray
@@ -214,24 +158,54 @@ class HTMSpatialPooler:
         Update the permanences of the synapses based on the active columns and input vector.
 
         Args:
-            active_columns (np.ndarray): The active columns.
-            input_vector (np.ndarray): The input vector.
+            active_columns (np.ndarray): The active columns of shape (batch_size, seq_len, num_minicolumns) or (batch_size * seq_len, num_minicolumns).
+            input_vector (np.ndarray): The input vector of shape (batch_size, seq_len, input_size) or (batch_size * seq_len, input_size).
         """
-        for i in range(self.num_minicolumns):
-            if active_columns[i]:
-                self.permanences[i, :][
-                    self.connections[i] == 1
-                ] += self.syn_perm_active_inc
-                self.permanences[i, :][
-                    self.connections[i] == 0
-                ] -= self.syn_perm_inactive_dec
+        input_shape = input_vector.shape
+        if len(input_shape) == 3:
+            batch_size, seq_len, input_size = input_shape
+        elif len(input_shape) == 2:
+            batch_size_seq_len, input_size = input_shape
+        else:
+            raise ValueError(f"Invalid input shape: {input_shape}")
+
+        # Update the permanences for active columns
+        active_columns_indices = np.transpose(np.nonzero(active_columns))
+        for batch_seq_idx, col_idx in active_columns_indices:
+            if len(input_shape) == 3:
+                batch_idx, seq_idx = batch_seq_idx // seq_len, batch_seq_idx % seq_len
+                self.permanences[col_idx] += (
+                    self.syn_perm_active_inc * input_vector[batch_idx, seq_idx]
+                )
             else:
-                self.permanences[i, :][
-                    self.connections[i] == 1
-                ] -= self.syn_perm_inactive_dec
-        self.permanences[self.permanences < 0] = 0
-        self.permanences[self.permanences > 1] = 1
-        self.connections = np.where(self.permanences >= self.syn_perm_connected, 1, 0)
+                self.permanences[col_idx] += (
+                    self.syn_perm_active_inc * input_vector[batch_seq_idx]
+                )
+
+        # Decay the permanences for inactive columns
+        inactive_columns = ~active_columns
+        for batch_seq_idx in range(inactive_columns.shape[0]):
+            for col_idx in range(self.num_minicolumns):
+                if (
+                    inactive_columns[batch_seq_idx, col_idx]
+                    and self.connections[col_idx].any()
+                ):
+                    if len(input_shape) == 3:
+                        batch_idx, seq_idx = (
+                            batch_seq_idx // seq_len,
+                            batch_seq_idx % seq_len,
+                        )
+                        self.permanences[col_idx] -= self.syn_perm_inactive_dec
+                    else:
+                        self.permanences[col_idx] -= self.syn_perm_inactive_dec
+
+        # Clip the permanences to the range [0, 1]
+        self.permanences = np.clip(self.permanences, 0, 1)
+
+        # Update the connections based on the permanences
+        self.connections = np.where(
+            self.permanences >= self.syn_perm_connected, 1.0, 0.0
+        )
 
     def update_duty_cycles(
         self, overlap: np.ndarray, active_columns: np.ndarray
@@ -240,15 +214,32 @@ class HTMSpatialPooler:
         Update the duty cycles of the minicolumns.
 
         Args:
-            overlap (np.ndarray): The overlap scores for each minicolumn.
-            active_columns (np.ndarray): The active columns.
+            overlap (np.ndarray): The overlap scores for each minicolumn of shape (batch_size, seq_len, num_minicolumns) or (batch_size * seq_len, num_minicolumns).
+            active_columns (np.ndarray): The active columns of shape (batch_size, seq_len, num_minicolumns) or (batch_size * seq_len, num_minicolumns).
         """
+        input_shape = overlap.shape
+        if len(input_shape) == 3:
+            batch_size, seq_len, _ = input_shape
+            overlap = overlap.reshape(batch_size * seq_len, self.num_minicolumns)
+            active_columns = active_columns.reshape(
+                batch_size * seq_len, self.num_minicolumns
+            )
+        else:
+            batch_size_seq_len, _ = input_shape
+
+        # Update the active duty cycles
         self.active_duty_cycles = (
-            self.active_duty_cycles * (self.duty_cycle_period - 1) + active_columns
+            self.active_duty_cycles * (self.duty_cycle_period - 1)
+            + np.sum(active_columns, axis=0)
         ) / self.duty_cycle_period
+
+        # Update the overlap duty cycles
         self.overlap_duty_cycles = (
-            self.overlap_duty_cycles * (self.duty_cycle_period - 1) + overlap
+            self.overlap_duty_cycles * (self.duty_cycle_period - 1)
+            + np.sum(overlap, axis=0)
         ) / self.duty_cycle_period
+
+        # Update the minimum overlap duty cycles
         self.min_overlap_duty_cycles = (
             self.active_duty_cycles * self.min_pct_overlap_duty_cycle
         )
@@ -257,45 +248,71 @@ class HTMSpatialPooler:
         """
         Update the boosting factors of the minicolumns.
         """
-        self.boosting_factors = np.clip(
-            np.exp2(
-                self.max_boost
-                * (self.min_overlap_duty_cycles - self.overlap_duty_cycles)
-            ),
-            1.0,
-            self.max_boost,
-        )
+        self.boosting_factors = np.exp(
+            self.max_boost * (self.min_overlap_duty_cycles - self.overlap_duty_cycles)
+        ).clip(1, self.max_boost)
 
     def compute(self, input_vector: np.ndarray) -> np.ndarray:
         """
         Compute the active columns for a given input vector.
 
         Args:
-            input_vector (np.ndarray): The input vector.
+            input_vector (np.ndarray): The input vector of shape (batch_size, seq_len, input_size).
 
         Returns:
-            np.ndarray: The active columns.
+            np.ndarray: The active columns of shape (batch_size, seq_len, num_minicolumns) or (batch_size * seq_len, num_minicolumns).
         """
-        overlap = self.compute_overlap(input_vector)
+        batch_size, seq_len, input_size = input_vector.shape
+        input_vector_reshaped = input_vector.reshape(batch_size * seq_len, input_size)
+
+        overlap = self.compute_overlap(input_vector_reshaped)
         active_columns = self.inhibit_columns(overlap * self.boosting_factors)
-        self.update_permanences(active_columns, input_vector)
+        self.update_permanences(active_columns, input_vector_reshaped)
         self.update_duty_cycles(overlap, active_columns)
         self.update_boosting_factors()
+
+        if len(input_vector_reshaped.shape) == 2:
+            active_columns = active_columns.reshape(
+                batch_size, seq_len, self.num_minicolumns
+            )
+        else:
+            active_columns = active_columns.reshape(
+                batch_size * seq_len, self.num_minicolumns
+            )
+
         return active_columns
 
-    def forward(self, input_vector: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, input_vector: Union[np.ndarray, torch.Tensor]
+    ) -> Union[np.ndarray, torch.Tensor]:
         """
-        Compute the active columns for a given input vector.
+        Perform the forward pass of the spatial pooler.
 
         Args:
-            input_vector (torch.Tensor): The input vector.
+            input_vector (Union[np.ndarray, torch.Tensor]): The input vector of shape (batch_size, seq_len, input_size).
 
         Returns:
-            torch.Tensor: The active columns.
+            Union[np.ndarray, torch.Tensor]: The active columns of shape (batch_size, seq_len, num_minicolumns) or (batch_size * seq_len, num_minicolumns).
         """
-        input_vector = input_vector.cpu().detach().numpy()
+        if isinstance(input_vector, torch.Tensor):
+            input_vector = input_vector.cpu().numpy()
+
         active_columns = self.compute(input_vector)
-        return torch.from_numpy(active_columns).float()
+
+        if isinstance(input_vector, torch.Tensor):
+            if active_columns.ndim == 3:
+                active_columns = (
+                    torch.from_numpy(active_columns).float().to(input_vector.device)
+                )
+            else:
+                active_columns = (
+                    torch.from_numpy(active_columns)
+                    .float()
+                    .to(input_vector.device)
+                    .unsqueeze(1)
+                )
+
+        return active_columns
 
 
 class HTMModel(nn.Module):
@@ -314,50 +331,72 @@ class HTMModel(nn.Module):
         self.device = device
         self.fc = nn.Linear(self.spatial_pooler.num_minicolumns, sdr_dimensions).to(
             device
-        )  # Adjust the input size of the fully connected layer
+        )
 
     def forward(self, input_sequence: torch.Tensor) -> torch.Tensor:
         """
         Process the input sequence using the HTM model.
 
         Args:
-            input_sequence (torch.Tensor): The sequence of input vectors.
+            input_sequence (torch.Tensor): The sequence of input vectors of shape (batch_size, seq_len, input_size).
 
         Returns:
-            torch.Tensor: The sequence of active columns.
+            torch.Tensor: The sequence of active columns of shape (batch_size, seq_len, num_minicolumns) or (batch_size * seq_len, num_minicolumns).
         """
-        device = input_sequence.device
-        batch_size, seq_len, _ = input_sequence.shape
+        batch_size, seq_len, input_size = input_sequence.shape
 
-        active_columns_sequence = []
-        for t in range(seq_len):
-            input_vector = input_sequence[:, t, :].cpu().numpy()
-            active_columns = self.spatial_pooler.forward(input_vector)
-            active_columns_sequence.append(active_columns)
+        # Resize the input sequence to match the expected input size
+        expected_input_size = self.spatial_pooler.input_size
+        if input_size != expected_input_size:
+            logger.warning(
+                f"Input sequence feature size {input_size} does not match the expected input size {expected_input_size}. Resizing the input sequence."
+            )
+            input_sequence = input_sequence[:, :, :expected_input_size]
 
-        active_columns_tensor = torch.stack(active_columns_sequence, dim=1).to(device)
+        # Compute the active columns for the input sequence
+        active_columns = self.spatial_pooler.forward(input_sequence)
+
+        # Convert active columns to a PyTorch tensor
+        if active_columns.ndim == 3:
+            active_columns_tensor = torch.tensor(
+                active_columns, dtype=torch.float32, device=self.device
+            )
+        else:
+            active_columns_tensor = torch.tensor(
+                active_columns, dtype=torch.float32, device=self.device
+            ).unsqueeze(1)
+
         logger.debug(
-            f"performing htm forward pass on input sequence of shape {input_sequence.shape}"
+            f"Performing HTM forward pass on input sequence of shape {input_sequence.shape}"
         )
         logger.debug(self.inspect())
-        output = self.fc(active_columns_tensor)  # Apply the fully connected layer
+
+        # Apply the fully connected layer
+        output = self.fc(active_columns_tensor)
+
+        if active_columns.ndim == 2:
+            output = output.squeeze(1)
+
         return output
 
-    def inspect(self):
+    def inspect(self) -> dict:
         """
-        View the HTM model.
+        View the HTM model parameters.
+
+        Returns:
+            dict: A dictionary containing the HTM model parameters.
         """
-        # logger.debug(self.spatial_pooler)
-        # logger.debug(self.spatial_pooler.connections)
-        # logger.debug(self.spatial_pooler.permanences)
-        # logger.debug(self.spatial_pooler.boosting_factors)
-        # logger.debug(self.spatial_pooler.active_duty_cycles)
-        # logger.debug(self.spatial_pooler.overlap_duty_cycles)
-        # logger.debug(self.spatial_pooler.min_overlap_duty_cycles)
-        # logger.debug(self.spatial_pooler.min_pct_overlap_duty_cycle)
-        # logger.debug(self.spatial_pooler.duty_cycle_period)
-        # logger.debug(self.spatial_pooler.max_boost)
-        # logger.debug(self.spatial_pooler.global_inhibition)
-        # logger.debug(self.spatial_pooler.inhibition_radius)
-        # logger.debug(self.spatial_pooler.num_active_columns_per_inhibition_area)
-        # return f"Model with {self.output_size} outputs"
+        inspection_data = {
+            "connections": self.spatial_pooler.connections,
+            "permanences": self.spatial_pooler.permanences,
+            "boosting_factors": self.spatial_pooler.boosting_factors,
+            "active_duty_cycles": self.spatial_pooler.active_duty_cycles,
+            "overlap_duty_cycles": self.spatial_pooler.overlap_duty_cycles,
+            "min_overlap_duty_cycles": self.spatial_pooler.min_overlap_duty_cycles,
+            "min_pct_overlap_duty_cycle": self.spatial_pooler.min_pct_overlap_duty_cycle,
+            "duty_cycle_period": self.spatial_pooler.duty_cycle_period,
+            "max_boost": self.spatial_pooler.max_boost,
+            "global_inhibition": self.spatial_pooler.global_inhibition,
+            "num_active_columns_per_inhibition_area": self.spatial_pooler.num_active_columns_per_inhibition_area,
+        }
+        return inspection_data

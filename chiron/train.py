@@ -103,25 +103,6 @@ def train(
     resume_from_latest: bool = True,
     model_name: str = "snn_model",
 ) -> Tuple[List[float], List[float]]:
-    """
-    Train the SNNModel on the given datasets.
-
-    Args:
-        model (SNNModel): The model to train.
-        train_dataloader (torch.utils.data.DataLoader): The training data loader.
-        val_dataloader (torch.utils.data.DataLoader): The validation data loader.
-        tokenizer (PreTrainedTokenizer): The tokenizer for the language model.
-        config (dict): The training configuration.
-        device (torch.device): The device to run the training on.
-        adjacency_matrix (Union[scipy.sparse.csr_matrix, torch.Tensor]): The adjacency matrix as a SciPy sparse matrix or a PyTorch tensor.
-        writer (SummaryWriter): The TensorBoard writer for logging.
-        checkpoint_dir (str): The directory to save checkpoints.
-        resume_from_latest (bool): Whether to resume training from the latest checkpoint.
-        model_name (str): The name of the model.
-
-    Returns:
-        Tuple[List[float], List[float]]: A tuple containing lists of training and validation losses for each epoch.
-    """
     optimizer = torch.optim.Adam(model.parameters(), lr=config["learning_rate"])
     criterion = nn.NLLLoss()
 
@@ -194,23 +175,14 @@ def train(
             with torch.cuda.amp.autocast():
                 # Forward pass
                 outputs = model(
-                    input_ids,
-                    attention_mask,
-                    adj_matrix_tensor,
-                    node_indices,
+                    input_ids, attention_mask, adj_matrix_tensor, node_indices
                 )
 
-                # Compute the loss
-                losses = []
-                for i in range(
-                    outputs.size(1)
-                ):  # Iterate over the sequence length dimension
-                    loss = criterion(
-                        outputs[:, i, :], labels[:, i, :]
-                    )  # Use the correct dimensions for outputs and labels
-                    losses.append(loss)
+                # Reshape the labels tensor to match the expected shape
+                labels = labels.view(-1, outputs.size(-1))
 
-                loss = torch.stack(losses).mean()  # Take the mean of the losses
+                # Compute the loss
+                loss = criterion(outputs, labels)
                 loss = loss / accumulation_steps
 
             # Backward pass with mixed-precision
@@ -278,7 +250,7 @@ def evaluate(
     dataloader: DataLoader,
     tokenizer: PreTrainedTokenizer,
     device: torch.device,
-    adjacency_matrix_batches: List[torch.Tensor],
+    adjacency_matrix: Union[scipy.sparse.csr_matrix, torch.Tensor],
 ) -> float:
     """
     Evaluate the model on the given dataset.
@@ -288,7 +260,7 @@ def evaluate(
         dataloader (DataLoader): The data loader for evaluation.
         tokenizer (PreTrainedTokenizer): The tokenizer for the language model.
         device (torch.device): The device to run the evaluation on.
-        adjacency_matrix_batches (List[torch.Tensor]): List of batch adjacency matrix tensors.
+        adjacency_matrix (Union[scipy.sparse.csr_matrix, torch.Tensor]): The adjacency matrix as a SciPy sparse matrix or a PyTorch tensor.
 
     Returns:
         float: The average loss on the evaluation dataset.
@@ -306,22 +278,23 @@ def evaluate(
             labels = labels.to(device)
             node_indices = node_indices.to(device)
 
+            # Convert the adjacency matrix to a dense PyTorch tensor if necessary
+            if isinstance(adjacency_matrix, scipy.sparse.csr_matrix):
+                adj_matrix_tensor = torch.tensor(
+                    adjacency_matrix.toarray(), dtype=torch.float32, device=device
+                )
+            else:
+                adj_matrix_tensor = adjacency_matrix.to(device)
+
             # Forward pass
-            outputs = model(
-                input_ids, attention_mask, adjacency_matrix_batches, node_indices
-            )
+            outputs = model(input_ids, attention_mask, adj_matrix_tensor, node_indices)
+            model.visualize_network()
+            model.visualize_data_flow(input_ids)
+            # Reshape the labels tensor to match the expected shape
+            labels = labels.view(-1, outputs.size(-1))
 
             # Compute the loss
-            losses = []
-            for i in range(
-                outputs.size(1)
-            ):  # Iterate over the sequence length dimension
-                loss = criterion(
-                    outputs[:, i, :], labels[:, i, :]
-                )  # Use the correct dimensions for outputs and labels
-                losses.append(loss)
-
-            loss = torch.stack(losses).mean()  # Take the mean of the losses
+            loss = criterion(outputs, labels)
 
             # Accumulate the loss
             total_loss += loss.item()
@@ -330,7 +303,7 @@ def evaluate(
 
     # Compute evaluation metrics
     text_prediction_metrics = evaluate_text_prediction(
-        model, tokenizer, dataloader.dataset, device, adjacency_matrix_batches
+        model, tokenizer, dataloader.dataset, device, adjacency_matrix
     )
     logger.info(f"Text Prediction Metrics: {text_prediction_metrics}")
 

@@ -126,10 +126,17 @@ class GraphAttentionLayer(nn.Module):
                 raise TypeError(f"Unsupported type for adj_matrix: {type(adj_matrix)}")
 
             # Ensure the adjacency matrix tensor has the correct shape
-            assert adj_matrix_tensor.shape == (
-                seq_len,
-                seq_len,
+            seq_len, _ = adj_matrix_tensor.shape
+            assert seq_len == input_tensor.size(
+                1
             ), f"Adjacency matrix should have shape (seq_len, seq_len), but got {adj_matrix_tensor.shape}"
+
+            # Expand the adjacency matrix tensor to match the shape of attn_scores
+            adj_matrix_tensor = (
+                adj_matrix_tensor.unsqueeze(0)
+                .unsqueeze(0)
+                .expand(batch_size, self.num_heads, seq_len, seq_len)
+            )
 
             # Mask the attention scores with the adjacency matrix
             attn_scores = attn_scores.masked_fill(adj_matrix_tensor == 0, float("-inf"))

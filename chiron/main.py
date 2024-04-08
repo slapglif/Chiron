@@ -1,9 +1,10 @@
 import argparse
 import os
 import sys
-from typing import Dict, List, Any
+from typing import Dict, List, Any, Tuple, Union
 
 import neptune
+import scipy
 from datasets import load_dataset as data_load
 from scipy.sparse import load_npz
 from sklearn.model_selection import KFold
@@ -19,6 +20,7 @@ from chiron.preprocessing.text_preprocessing import TextPreprocessor
 from chiron.train import train, collate_fn
 from chiron.utils.config import Config
 from chiron.utils.data import SemanticFoldingDataset
+from chiron.utils.tokenization import EmbeddingTokenizer
 
 os.environ["JOBLIB_MULTIPROCESSING"] = "0"
 
@@ -65,7 +67,27 @@ def compute_and_save_adjacency_matrix(
     eps: float = 0.5,
     min_samples: int = 10,
     chunk_size: int = 10000,
-) -> None:
+) -> Tuple[Union[scipy.sparse.csr_matrix, torch.Tensor], int]:
+    """
+    Compute and save the adjacency matrix using similarity thresholding and fallback strategies.
+
+    Args:
+        sdr_embeddings (torch.Tensor): The SDR embeddings tensor.
+        threshold (float): The similarity threshold for creating edges in the adjacency matrix.
+        batch_size (int): The batch size for computing similarity scores.
+        output_file (str): The path to save the adjacency matrix.
+        device (torch.device): The device to use for computations.
+        fallback_mode (str): The fallback strategy to use when the adjacency matrix is too large.
+            Options: "subsample" or "cluster".
+        subsample_ratio (float): The ratio of embeddings to subsample when using the "subsample" fallback mode.
+        num_clusters (int): The number of clusters to use when using the "cluster" fallback mode.
+        eps (float): The epsilon parameter for DBSCAN clustering.
+        min_samples (int): The minimum number of samples per cluster for DBSCAN clustering.
+        chunk_size (int): The chunk size for processing embeddings in batches.
+
+    Returns:
+        Tuple[Union[scipy.sparse.csr_matrix, torch.Tensor], int]: The computed adjacency matrix and the number of embeddings.
+    """
     # Move the SDR embeddings tensor to the specified device
     sdr_embeddings = sdr_embeddings.to(device)
 
@@ -95,6 +117,8 @@ def compute_and_save_adjacency_matrix(
         )
         unique_labels = np.unique(cluster_labels)
         num_clusters = len(unique_labels)
+    else:
+        raise ValueError(f"Invalid fallback mode: {fallback_mode}")
 
     # Create a sparse matrix in COO format
     row_indices = []
@@ -176,12 +200,12 @@ def compute_and_save_adjacency_matrix(
     data = np.concatenate(data)
 
     # Create a sparse matrix in CSR format
-    adjacency_matrix_sparse = csr_matrix(
+    adjacency_matrix_sparse = scipy.sparse.csr_matrix(
         (data, (row_indices, col_indices)), shape=(num_embeddings, num_embeddings)
     )
 
     # Save the adjacency matrix to a file
-    save_npz(output_file, adjacency_matrix_sparse)
+    scipy.sparse.save_npz(output_file, adjacency_matrix_sparse)
     logger.info(f"Adjacency matrix saved to: {output_file}")
 
     # Return the adjacency matrix and the original number of embeddings
@@ -327,12 +351,14 @@ def main(config_path: str) -> None:
         )
 
         logger.info(f"Creating SNN model for fold {fold + 1}...")
+        # tokenizer = EmbeddingTokenizer(vocab_size=len(preprocessor.vocab))
         snn_model = SNNModel(
             sp_params=config["sdr_params"],
             gat_params=config["gat_params"],
             htm_params=config["htm_params"],
             snn_params=config["snn_params"],
             device=device,
+            tokenizer=tokenizer,
         ).to(device)
 
         if torch.cuda.device_count() > 1:
