@@ -1,7 +1,9 @@
-from typing import Union
+# chiron/layers/snn/graph_attention.py
+
+from typing import Union, Optional
 
 import numpy as np
-import scipy
+import scipy.sparse
 import torch
 import torch.nn as nn
 from loguru import logger
@@ -10,6 +12,21 @@ from loguru import logger
 class GraphAttentionLayer(nn.Module):
     """
     Graph Attention Layer implementation.
+
+    This layer applies a multi-head self-attention mechanism to the input tensor, taking into account
+    the provided adjacency matrix. The attention mechanism is used to compute attention scores between
+    nodes in the graph, and these scores are then used to update the node representations.
+
+    Attributes:
+        in_features (int): The number of input features.
+        out_features (int): The number of output features.
+        num_heads (int): The number of attention heads.
+        dropout (float): The dropout probability for the attention weights.
+        alpha (float): The negative slope for the LeakyReLU activation function.
+        concat (bool): If True, the output features from different attention heads are concatenated.
+            Otherwise, the output features are averaged across the attention heads.
+        fallback_mode (str): The fallback mode to use when the adjacency matrix is too large.
+            Accepted values are 'dense' (use a dense adjacency matrix) and 'sparse' (use a sparse adjacency matrix).
     """
 
     def __init__(
@@ -22,6 +39,20 @@ class GraphAttentionLayer(nn.Module):
         concat: bool = True,
         fallback_mode: str = "dense",
     ):
+        """
+        Initialize the GraphAttentionLayer.
+
+        Args:
+            in_features (int): The number of input features.
+            out_features (int): The number of output features.
+            num_heads (int): The number of attention heads.
+            dropout (float): The dropout probability for the attention weights.
+            alpha (float): The negative slope for the LeakyReLU activation function.
+            concat (bool): If True, the output features from different attention heads are concatenated.
+                Otherwise, the output features are averaged across the attention heads.
+            fallback_mode (str): The fallback mode to use when the adjacency matrix is too large.
+                Accepted values are 'dense' (use a dense adjacency matrix) and 'sparse' (use a sparse adjacency matrix).
+        """
         super(GraphAttentionLayer, self).__init__()
         self.in_features = in_features
         self.out_features = out_features
@@ -90,17 +121,22 @@ class GraphAttentionLayer(nn.Module):
     def forward(
         self,
         input_tensor: torch.Tensor,
-        adj_matrix: Union[np.ndarray, scipy.sparse.csr_matrix, torch.Tensor] = None,
+        adj_matrix: Optional[
+            Union[np.ndarray, scipy.sparse.csr_matrix, torch.Tensor]
+        ] = None,
     ) -> torch.Tensor:
         """
         Compute the output features for the input tensor.
 
         Args:
             input_tensor (torch.Tensor): Input tensor of shape (batch_size, seq_len, num_features).
-            adj_matrix (Union[np.ndarray, scipy.sparse.csr_matrix, torch.Tensor], optional): Adjacency matrix as a NumPy array, a SciPy sparse matrix, or a PyTorch tensor of shape (seq_len, seq_len). Default is None.
+            adj_matrix (Optional[Union[np.ndarray, scipy.sparse.csr_matrix, torch.Tensor]], optional):
+                Adjacency matrix as a NumPy array, a SciPy sparse matrix, or a PyTorch tensor of shape
+                (seq_len, seq_len). Default is None.
 
         Returns:
-            torch.Tensor: Output tensor of shape (batch_size, seq_len, num_heads * out_features_per_head) or (batch_size, seq_len, out_features).
+            torch.Tensor: Output tensor of shape (batch_size, seq_len, num_heads * out_features_per_head)
+                or (batch_size, seq_len, out_features).
         """
         batch_size, seq_len, num_features = input_tensor.size()
         logger.debug(f"input_tensor shape: {input_tensor.shape}")

@@ -20,7 +20,6 @@ from chiron.preprocessing.text_preprocessing import TextPreprocessor
 from chiron.train import train, collate_fn
 from chiron.utils.config import Config
 from chiron.utils.data import SemanticFoldingDataset
-from chiron.utils.tokenization import EmbeddingTokenizer
 
 os.environ["JOBLIB_MULTIPROCESSING"] = "0"
 
@@ -283,6 +282,13 @@ def main(config_path: str) -> None:
     logger.info(f"Number of preprocessed tokens: {len(preprocessed_conversations)}")
     logger.debug(f"First preprocessed token: {preprocessed_conversations[0]}")
 
+    # Build the vocabulary
+    # preprocessor.build_vocabulary(preprocessed_conversations)
+
+    # Create the tokenizer with the built vocabulary
+    # tokenizer = EmbeddingTokenizer(vocab_size=len(preprocessor.vocab))
+    tokenizer = BertTokenizer.from_pretrained(config["tokenizer"]["name"])
+
     # Generate word embeddings
     logger.info("Generating word embeddings...")
     embedding_model = Word2VecEmbedding(**config["embedding_params"])
@@ -298,6 +304,9 @@ def main(config_path: str) -> None:
         sdr_generator.generate_sdr_embeddings(embeddings), dtype=torch.float32
     )
     logger.info(f"SDR embeddings shape: {sdr_embeddings.shape}")
+
+    # Update the sp_params dictionary with the sdr_embeddings tensor
+    config["sdr_params"]["sdr_embeddings"] = sdr_embeddings
 
     # Create an adjacency matrix
     logger.info("Creating adjacency matrix...")
@@ -315,8 +324,7 @@ def main(config_path: str) -> None:
     )
     adjacency_matrix = load_adjacency_matrix(adjacency_matrix_file)
 
-    tokenizer = BertTokenizer.from_pretrained(config["tokenizer"]["name"])
-
+    # tokenizer = EmbeddingTokenizer(vocab_size=len(preprocessor.vocab))
     # Create dataset
     dataset = SemanticFoldingDataset(sdr_embeddings, tokenizer)
 
@@ -351,14 +359,13 @@ def main(config_path: str) -> None:
         )
 
         logger.info(f"Creating SNN model for fold {fold + 1}...")
-        # tokenizer = EmbeddingTokenizer(vocab_size=len(preprocessor.vocab))
+
         snn_model = SNNModel(
             sp_params=config["sdr_params"],
             gat_params=config["gat_params"],
             htm_params=config["htm_params"],
             snn_params=config["snn_params"],
             device=device,
-            tokenizer=tokenizer,
         ).to(device)
 
         if torch.cuda.device_count() > 1:
