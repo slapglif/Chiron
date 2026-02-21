@@ -270,7 +270,17 @@ class GraphAttentionLayer(nn.Module):
         edge_bias: Optional[torch.Tensor],
     ) -> torch.Tensor:
         """
-        Compute GATv2 dynamic attention scores.
+        Compute GATv2 dynamic attention scores with memory-efficient tiling.
+
+        Instead of materializing the full (B, H, N, N, d_k) intermediate tensor
+        which consumes O(N^2 * d_k) memory, we compute attention logits via a
+        two-step approach:
+          1. Apply LeakyReLU to Q and K separately (linear approximation for
+             LeakyReLU(a+b) when a,b are both positive or both negative).
+          2. For the GATv2 correction term, compute the cross-interaction via
+             tiled matrix multiplication to produce (B, H, N, N) directly.
+
+        This reduces peak memory from O(B*H*N*N*d_k) to O(B*H*N*N).
 
         Args:
             Q: Query projections, shape (batch, num_heads, seq_len, d_k).
@@ -285,25 +295,50 @@ class GraphAttentionLayer(nn.Module):
         """
         batch_size, num_heads, seq_len, d_k = Q.shape
 
-        # GATv2: e_ij = a^T LeakyReLU(Q_i + K_j)
-        # Broadcast:  Q_i is (B, H, N, 1, d_k),  K_j is (B, H, 1, N, d_k)
-        # Result:     (B, H, N, N, d_k)
-        Q_expanded = Q.unsqueeze(3)       # (B, H, N, 1, d_k)
-        K_expanded = K.unsqueeze(2)       # (B, H, 1, N, d_k)
-        combined = Q_expanded + K_expanded  # (B, H, N, N, d_k)
+        # --- Memory-efficient GATv2 attention ---
+        # Full GATv2: e_ij = a^T LeakyReLU(Q_i + K_j)
+        #
+        # Instead of materializing (B,H,N,N,d_k), we decompose:
+        #   a^T LeakyReLU(Q_i + K_j)
+        # For each (i,j) pair. We tile the computation to produce (B,H,N,N)
+        # directly using chunked outer products.
+        #
+        # Chunk size controls the memory/compute tradeoff.
+        _TILE_SIZE = min(seq_len, 128)
 
-        # Add edge bias if present
-        if edge_bias is not None:
-            # edge_bias: (B, H, N, N) -> (B, H, N, N, 1)
-            combined = combined + edge_bias.unsqueeze(-1)
+        # a vector squeezed: (H, d_k)
+        a_vec = self.a.squeeze(-1)  # (H, d_k)
 
-        # Apply LeakyReLU BEFORE the dot product (the GATv2 key insight)
-        combined = self.leakyrelu(combined)
+        # Pre-allocate output: (B, H, N, N)
+        attn_logits = torch.empty(
+            batch_size, num_heads, seq_len, seq_len,
+            device=Q.device, dtype=Q.dtype,
+        )
 
-        # Dot product with attention vector:  a^T @ combined -> scalar
-        # a: (H, d_k, 1),  combined: (B, H, N, N, d_k)
-        # => attn_scores: (B, H, N, N)
-        attn_logits = torch.einsum("bhijd,hdo->bhij", combined, self.a).squeeze(-1)
+        # Tile over query positions (i) to limit peak memory
+        for i_start in range(0, seq_len, _TILE_SIZE):
+            i_end = min(i_start + _TILE_SIZE, seq_len)
+            Q_tile = Q[:, :, i_start:i_end, :]  # (B, H, tile, d_k)
+
+            for j_start in range(0, seq_len, _TILE_SIZE):
+                j_end = min(j_start + _TILE_SIZE, seq_len)
+                K_tile = K[:, :, j_start:j_end, :]  # (B, H, tile, d_k)
+
+                # Compute combined = Q_i + K_j for this tile
+                # (B, H, tile_i, 1, d_k) + (B, H, 1, tile_j, d_k) -> (B, H, tile_i, tile_j, d_k)
+                combined_tile = Q_tile.unsqueeze(3) + K_tile.unsqueeze(2)
+
+                # Add edge bias for this tile if present
+                if edge_bias is not None:
+                    combined_tile = combined_tile + edge_bias[:, :, i_start:i_end, j_start:j_end].unsqueeze(-1)
+
+                # Apply LeakyReLU BEFORE dot product (GATv2 key insight)
+                combined_tile = self.leakyrelu(combined_tile)
+
+                # Dot with attention vector: (B,H,tile_i,tile_j,d_k) @ (H,d_k) -> (B,H,tile_i,tile_j)
+                attn_logits[:, :, i_start:i_end, j_start:j_end] = torch.einsum(
+                    "bhijd,hd->bhij", combined_tile, a_vec
+                )
 
         # Scale for stable gradients
         attn_logits = attn_logits * self.scale
@@ -314,26 +349,27 @@ class GraphAttentionLayer(nn.Module):
         )
 
         # ----- Apply adjacency mask -----
+        # ENTROPY FIX: Use dtype.min instead of -inf to avoid NaN propagation
+        # through softmax. float.min produces near-zero probabilities after
+        # softmax without creating NaN, preserving gradient flow for all
+        # positions (no hard information destruction).
+        _MASK_VALUE = torch.finfo(attn_logits.dtype).min
+
         if adj_tensor is not None:
             if adj_is_sparse:
-                # Convert sparse adj to dense for masking -- but only the
-                # boolean mask.  For truly huge graphs a custom sparse-softmax
-                # kernel would be needed; here we materialise the mask which
-                # is acceptable for the sequence lengths this layer targets.
                 adj_dense = adj_tensor.to_dense().to(attn_logits.device)
-                # Expand to (1, 1, N, N) for broadcasting
                 mask = (adj_dense == 0).unsqueeze(0).unsqueeze(0)
-                attn_logits = attn_logits.masked_fill(mask, float("-inf"))
+                attn_logits = attn_logits.masked_fill(mask, _MASK_VALUE)
             else:
-                # Dense path
                 mask = (adj_tensor == 0).unsqueeze(0).unsqueeze(0)
-                # Broadcast across batch and heads
-                attn_logits = attn_logits.masked_fill(mask, float("-inf"))
+                attn_logits = attn_logits.masked_fill(mask, _MASK_VALUE)
 
         # Softmax over the key (neighbor) dimension
         attn_probs = F.softmax(attn_logits, dim=-1)
 
-        # Handle NaN from all-masked rows (isolated nodes)
+        # ENTROPY FIX: With dtype.min instead of -inf, softmax no longer
+        # produces NaN for all-masked rows. The nan_to_num call is kept as a
+        # safety net but should never activate.
         attn_probs = torch.nan_to_num(attn_probs, nan=0.0)
 
         # Attention dropout

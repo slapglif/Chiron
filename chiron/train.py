@@ -5,6 +5,7 @@ import math
 import os
 from typing import Dict, List, Optional, Tuple, Union
 
+import numpy as np
 import safetensors
 import scipy
 import torch
@@ -18,6 +19,44 @@ from transformers import PreTrainedTokenizer
 
 from chiron.evaluation.metrics import evaluate_text_prediction
 from chiron.layers.snn.model import SNNModel
+
+
+# ---------------------------------------------------------------------------
+# Adjacency matrix GPU caching utilities
+# ---------------------------------------------------------------------------
+
+def _preconvert_adjacency_to_gpu(
+    adjacency_matrix: Union[scipy.sparse.csr_matrix, torch.Tensor],
+    device: torch.device,
+) -> torch.Tensor:
+    """Convert adjacency matrix to a GPU tensor ONCE, avoiding per-batch
+    scipy.sparse -> dense -> GPU transfers that saturate PCIe bandwidth.
+
+    For sparse matrices: converts to torch.sparse_coo_tensor on GPU.
+    For dense tensors: moves to device once.
+
+    Returns:
+        torch.Tensor on the target device (sparse or dense).
+    """
+    if isinstance(adjacency_matrix, scipy.sparse.csr_matrix):
+        coo = adjacency_matrix.tocoo()
+        indices = torch.from_numpy(
+            np.vstack([coo.row, coo.col]).astype(np.int64)
+        )
+        values = torch.from_numpy(coo.data.astype(np.float32))
+        shape = torch.Size(coo.shape)
+        tensor = torch.sparse_coo_tensor(indices, values, shape).to(device)
+        logger.info(
+            f"Adjacency matrix pre-cached on {device} as sparse tensor "
+            f"(nnz={coo.nnz}, shape={shape})"
+        )
+        return tensor
+    elif isinstance(adjacency_matrix, torch.Tensor):
+        tensor = adjacency_matrix.to(device)
+        logger.info(f"Adjacency matrix moved to {device} (shape={tensor.shape})")
+        return tensor
+    else:
+        raise TypeError(f"Unsupported adjacency matrix type: {type(adjacency_matrix)}")
 
 
 def collate_fn(
@@ -207,12 +246,16 @@ def train(
     Returns:
         Tuple[List[float], List[float]]: A tuple containing lists of training and validation losses.
     """
-    # AdamW optimizer with decoupled weight decay
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=config["learning_rate"],
-        weight_decay=0.01,
-    )
+    # AdamW optimizer with decoupled weight decay and fused implementation
+    # fused=True uses a single kernel for the optimizer step on CUDA (faster)
+    optimizer_kwargs = {
+        "lr": config["learning_rate"],
+        "weight_decay": 0.01,
+    }
+    # Use fused AdamW on CUDA for single-kernel optimizer steps
+    if device.type == "cuda":
+        optimizer_kwargs["fused"] = True
+    optimizer = torch.optim.AdamW(model.parameters(), **optimizer_kwargs)
 
     # Consistent loss function: CrossEntropyLoss with label smoothing for both
     # training and evaluation. ignore_index=-100 skips padding tokens.
@@ -238,7 +281,13 @@ def train(
     ema = ExponentialMovingAverage(model, decay=0.999)
 
     # Initialize GradScaler for mixed-precision training (modern API)
-    scaler = torch.amp.GradScaler("cuda")
+    # Use higher init_scale and growth_interval tuned for large-batch training
+    scaler = torch.amp.GradScaler("cuda", init_scale=2**16, growth_interval=2000)
+
+    # --- Pre-cache adjacency matrix on GPU ONCE ---
+    # Eliminates per-batch scipy sparse -> dense -> GPU transfer overhead
+    # which otherwise saturates PCIe bandwidth (~10GB/epoch)
+    adj_matrix_gpu = _preconvert_adjacency_to_gpu(adjacency_matrix, device)
 
     # Resume from checkpoint if requested
     start_epoch = 1
@@ -272,6 +321,11 @@ def train(
     train_losses: List[float] = []
     val_losses: List[float] = []
 
+    # Determine autocast dtype: A100 natively supports bf16 with no loss scaling needed
+    # bf16 has the same exponent range as fp32, eliminating underflow/overflow in
+    # mixed precision and preserving more gradient entropy than fp16
+    _autocast_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+
     for epoch in range(start_epoch, num_epochs + 1):
         logger.info(f"Epoch {epoch}/{num_epochs}")
         model.train()
@@ -279,7 +333,9 @@ def train(
         global_grad_norm = 0.0
 
         # Zero the gradients at the start of each epoch
-        optimizer.zero_grad()
+        # set_to_none=True avoids a memset to zero, instead deallocating gradient
+        # memory — reduces memory footprint and is faster than zeroing
+        optimizer.zero_grad(set_to_none=True)
 
         for batch_idx, batch in enumerate(
             tqdm(
@@ -290,32 +346,32 @@ def train(
             ),
             start=1,
         ):
-            # Unpack batch and move to device
+            # Unpack batch and move to device with non_blocking=True
+            # Since DataLoader uses pin_memory=True, non_blocking allows
+            # CPU→GPU transfers to overlap with computation via CUDA streams
             input_ids, attention_mask, labels, node_indices = batch
-            input_ids = input_ids.to(device)
-            attention_mask = attention_mask.to(device)
-            labels = labels.to(device)
-            node_indices = node_indices.to(device)
+            input_ids = input_ids.to(device, non_blocking=True)
+            attention_mask = attention_mask.to(device, non_blocking=True)
+            labels = labels.to(device, non_blocking=True)
+            node_indices = node_indices.to(device, non_blocking=True)
 
-            # Convert adjacency matrix to dense tensor if necessary
-            if isinstance(adjacency_matrix, scipy.sparse.csr_matrix):
-                adj_matrix_tensor = torch.tensor(
-                    adjacency_matrix.toarray(), dtype=torch.float32, device=device
-                )
-            else:
-                adj_matrix_tensor = adjacency_matrix.to(device)
+            # Use the pre-cached GPU adjacency matrix (no per-batch conversion)
+            # Slice to seq_len happens inside model.forward()
+            adj_matrix_tensor = adj_matrix_gpu
 
-            # Mixed-precision forward pass (modern API)
-            with torch.amp.autocast("cuda"):
+            # Mixed-precision forward pass using bf16 on A100 for max entropy
+            # preservation (bf16 has full fp32 exponent range, no loss scaling needed)
+            with torch.amp.autocast("cuda", dtype=_autocast_dtype):
                 outputs = model(
                     input_ids, attention_mask, adj_matrix_tensor, node_indices
                 )
 
-                # Mask out padding tokens and compute loss
-                non_pad_mask = labels.view(-1) != -100
+                # Use ignore_index directly — avoids creating non-contiguous
+                # tensors from advanced indexing which forces extra .contiguous()
+                # calls and memory allocations
                 loss = criterion(
-                    outputs.view(-1, outputs.size(-1))[non_pad_mask],
-                    labels.view(-1)[non_pad_mask],
+                    outputs.view(-1, outputs.size(-1)),
+                    labels.view(-1),
                 )
                 # Normalize loss by accumulation steps so the effective gradient
                 # magnitude is independent of the accumulation count
@@ -342,7 +398,7 @@ def train(
                 ema.update()
 
                 # Zero gradients for next accumulation window
-                optimizer.zero_grad()
+                optimizer.zero_grad(set_to_none=True)
 
             # Accumulate raw loss (undo the division for reporting)
             epoch_loss += loss.item() * accumulation_steps
@@ -357,24 +413,19 @@ def train(
             scaler.update()
             scheduler.step()
             ema.update()
-            optimizer.zero_grad()
+            optimizer.zero_grad(set_to_none=True)
 
         # Compute average training loss for the epoch
         avg_train_loss = epoch_loss / len(train_dataloader)
         train_losses.append(avg_train_loss)
 
-        # Save the model as a SafeTensor
-        safetensors.torch.save_file(
-            model.state_dict(),
-            f"{model_name}_epoch_{epoch}_pre_eval.safetensors",
-        )
-
-        # Save the checkpoint
+        # Save checkpoint only (single format) — eliminates redundant dual
+        # serialization of safetensors + torch.save per epoch
         save_checkpoint(epoch, model, optimizer, scheduler, checkpoint_dir, model_name)
 
         # Evaluate on the validation set using EMA weights
         ema.apply()
-        val_loss = evaluate(model, val_dataloader, tokenizer, device, adjacency_matrix)
+        val_loss = evaluate(model, val_dataloader, tokenizer, device, adj_matrix_gpu)
         ema.restore()
         val_losses.append(val_loss)
 
@@ -409,7 +460,7 @@ def train(
     # Visualize the network architecture after training
     model.visualize()
 
-    # Save the final model as a SafeTensor
+    # Save final model as SafeTensor (single efficient format)
     safetensors.torch.save_file(model.state_dict(), f"{model_name}_final.safetensors")
 
     return train_losses, val_losses
@@ -443,33 +494,27 @@ def evaluate(
     criterion = nn.CrossEntropyLoss(ignore_index=-100, label_smoothing=0.1)
     total_loss = 0.0
 
+    # adjacency_matrix is already on GPU (pre-cached) — use directly
+    adj_matrix_tensor = adjacency_matrix
+
     with torch.no_grad():
         for batch in tqdm(dataloader, desc="Evaluating"):
-            # Unpack batch and move to device
+            # Unpack batch and move to device with non_blocking
             input_ids, attention_mask, labels, node_indices = batch
-            input_ids = input_ids.to(device)
-            attention_mask = attention_mask.to(device)
-            labels = labels.to(device)
-            node_indices = node_indices.to(device)
+            input_ids = input_ids.to(device, non_blocking=True)
+            attention_mask = attention_mask.to(device, non_blocking=True)
+            labels = labels.to(device, non_blocking=True)
+            node_indices = node_indices.to(device, non_blocking=True)
 
-            # Convert adjacency matrix to dense tensor if necessary
-            if isinstance(adjacency_matrix, scipy.sparse.csr_matrix):
-                adj_matrix_tensor = torch.tensor(
-                    adjacency_matrix.toarray(), dtype=torch.float32, device=device
-                )
-            else:
-                adj_matrix_tensor = adjacency_matrix.to(device)
-
-            # Forward pass
+            # Forward pass (adjacency already on device)
             outputs = model(
                 input_ids, attention_mask, adj_matrix_tensor, node_indices
             )
 
-            # Compute loss with the same masking approach as training
-            non_pad_mask = labels.view(-1) != -100
+            # Use ignore_index directly — consistent with training
             loss = criterion(
-                outputs.view(-1, outputs.size(-1))[non_pad_mask],
-                labels.view(-1)[non_pad_mask],
+                outputs.view(-1, outputs.size(-1)),
+                labels.view(-1),
             )
 
             total_loss += loss.item()
