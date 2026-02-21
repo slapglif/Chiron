@@ -1,61 +1,114 @@
 # chiron/layers/htm/model.py
+#
+# Fully differentiable HTM Spatial Pooler in PyTorch.
+# All computation is done on GPU-compatible tensors -- no numpy, no CPU round-trips.
 
-from typing import Union
+from __future__ import annotations
 
-import numpy as np
+from typing import Optional
+
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 from loguru import logger
-from torch import nn
 
 
-class HTMSpatialPooler:
+# ---------------------------------------------------------------------------
+# Straight-Through Estimator helpers
+# ---------------------------------------------------------------------------
+
+class _STEThreshold(torch.autograd.Function):
+    """Hard threshold in the forward pass, straight-through gradient in backward."""
+
+    @staticmethod
+    def forward(ctx, x: torch.Tensor) -> torch.Tensor:
+        return (x >= 0.0).float()
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor) -> torch.Tensor:
+        # Pass gradient through unchanged (straight-through estimator).
+        return grad_output
+
+
+class _STETopK(torch.autograd.Function):
+    """Top-k binary mask in forward, straight-through gradient in backward."""
+
+    @staticmethod
+    def forward(ctx, scores: torch.Tensor, k: int) -> torch.Tensor:
+        # scores: (N, C)  ->  mask: (N, C) with exactly k ones per row
+        _, topk_indices = scores.topk(k, dim=-1)
+        mask = torch.zeros_like(scores)
+        mask.scatter_(-1, topk_indices, 1.0)
+        return mask
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor) -> tuple:
+        # Straight-through: pass gradient to all positions.
+        return grad_output, None
+
+
+def _ste_threshold(x: torch.Tensor) -> torch.Tensor:
+    """Apply hard threshold at 0 with straight-through estimator."""
+    return _STEThreshold.apply(x)
+
+
+def _ste_topk(scores: torch.Tensor, k: int) -> torch.Tensor:
+    """Select top-k positions with straight-through estimator."""
+    return _STETopK.apply(scores, k)
+
+
+# ---------------------------------------------------------------------------
+# HTMSpatialPooler  -- fully differentiable, pure PyTorch
+# ---------------------------------------------------------------------------
+
+class HTMSpatialPooler(nn.Module):
     """
-    Hierarchical Temporal Memory (HTM) Spatial Pooler implementation.
+    Hierarchical Temporal Memory (HTM) Spatial Pooler -- differentiable PyTorch edition.
 
-    This class implements the spatial pooling algorithm used in the HTM model.
-    It computes the overlap between the input vector and the minicolumn connections,
-    performs inhibition to determine the active columns, and updates the permanences
-    and duty cycles based on the active columns and input vector.
+    Key design choices:
+      * Permanences are stored as an ``nn.Parameter`` so they participate in
+        autograd and can optionally be tuned by an external optimiser.
+      * The binary *connected* mask is produced by a **sigmoid approximation**
+        of the step function at ``syn_perm_connected`` with a configurable
+        sharpness (``sigmoid_sharpness``).  Gradients flow through the sigmoid
+        in the backward pass (straight-through estimator on top for the final
+        binarisation when needed).
+      * Overlap, boosting, inhibition, and Hebbian permanence updates are
+        fully vectorised (no Python loops over columns or batch elements).
+      * Duty-cycle tracking uses an exponential moving average (EMA).
     """
 
     def __init__(
-            self,
-            input_size: int,
-            minicolumn_size: int,
-            potential_radius: int,
-            potential_pct: float,
-            global_inhibition: bool,
-            local_area_density: float,
-            num_active_columns_per_inhibition_area: int,
-            stimulus_threshold: float,
-            syn_perm_inactive_dec: float,
-            syn_perm_active_inc: float,
-            syn_perm_connected: float,
-            min_pct_overlap_duty_cycle: float,
-            duty_cycle_period: int,
-            max_boost: float,
-            seed: int,
+        self,
+        input_size: int,
+        minicolumn_size: int,
+        potential_radius: int,
+        potential_pct: float,
+        global_inhibition: bool,
+        local_area_density: float,
+        num_active_columns_per_inhibition_area: int,
+        stimulus_threshold: float,
+        syn_perm_inactive_dec: float,
+        syn_perm_active_inc: float,
+        syn_perm_connected: float,
+        min_pct_overlap_duty_cycle: float,
+        duty_cycle_period: int,
+        max_boost: float,
+        seed: int,
+        sigmoid_sharpness: float = 10.0,
+        **extra_kwargs,
     ):
-        """
-        Initialize the HTMSpatialPooler.
+        super().__init__()
 
-        Args:
-            input_size (int): The size of the input vector.
-            minicolumn_size (int): The size of a minicolumn.
-            potential_radius (int): The radius of potential connections.
-            potential_pct (float): The percentage of potential connections.
-            global_inhibition (bool): Whether to use global inhibition.
-            local_area_density (float): The density of active columns within a local inhibition area.
-            num_active_columns_per_inhibition_area (int): The number of active columns per inhibition area.
-            stimulus_threshold (float): The stimulus threshold for a synapse to be considered active.
-            syn_perm_inactive_dec (float): The amount by which an inactive synapse's permanence value is decremented.
-            syn_perm_active_inc (float): The amount by which an active synapse's permanence value is incremented.
-            syn_perm_connected (float): The permanence value above which a synapse is considered connected.
-            min_pct_overlap_duty_cycle (float): The minimum percentage of overlap duty cycle before inhibition.
-            duty_cycle_period (int): The period used to calculate duty cycles.
-            max_boost (float): The maximum boost value.
-            seed (int): The random seed.
-        """
+        # Warn about (and ignore) unrecognised keyword arguments so that
+        # call-sites that forward ``seq_len`` or similar do not crash.
+        if extra_kwargs:
+            logger.debug(
+                f"HTMSpatialPooler ignoring unrecognised kwargs: "
+                f"{list(extra_kwargs.keys())}"
+            )
+
+        # ---- hyper-parameters --------------------------------------------------
         self.input_size = input_size
         self.minicolumn_size = minicolumn_size
         self.num_minicolumns = (input_size + minicolumn_size - 1) // minicolumn_size
@@ -72,348 +125,355 @@ class HTMSpatialPooler:
         self.duty_cycle_period = duty_cycle_period
         self.max_boost = max_boost
         self.seed = seed
+        self.sigmoid_sharpness = sigmoid_sharpness
 
-        # Initialize the connections and permanence matrices
-        self.connections = np.random.rand(self.num_minicolumns, self.input_size)
-        self.connections[self.connections < self.syn_perm_connected] = 0
-        self.connections[self.connections >= self.syn_perm_connected] = 1
+        # ---- derived constants -------------------------------------------------
+        # EMA decay factor:  alpha  s.t.  effective window ~ duty_cycle_period
+        self._ema_alpha: float = 2.0 / (duty_cycle_period + 1.0)
+        self._num_active: int = min(
+            num_active_columns_per_inhibition_area, self.num_minicolumns
+        )
 
-        self.permanences = np.zeros((self.num_minicolumns, self.input_size))
+        # ---- deterministic initialisation with the given seed ------------------
+        gen = torch.Generator()
+        gen.manual_seed(seed)
 
-        # Initialize the duty cycles and boosting factors
-        self.active_duty_cycles = np.zeros(self.num_minicolumns)
-        self.overlap_duty_cycles = np.zeros(self.num_minicolumns)
-        self.min_overlap_duty_cycles = np.zeros(self.num_minicolumns)
-        self.boosting_factors = np.ones(self.num_minicolumns)
+        # Potential synapses mask  (num_minicolumns, input_size)
+        # Each column samples ``potential_pct`` fraction of inputs within
+        # ``potential_radius`` of its "centre".
+        potential_mask = self._init_potential_mask(gen)
+        self.register_buffer("potential_mask", potential_mask)
 
-    def compute_overlap(
-            self, input_vector: Union[np.ndarray, torch.Tensor]
-    ) -> Union[np.ndarray, torch.Tensor]:
+        # Permanences initialised around the connected threshold.
+        init_perm = torch.empty(self.num_minicolumns, input_size)
+        init_perm.uniform_(
+            syn_perm_connected - 0.05,
+            syn_perm_connected + 0.05,
+            generator=gen,
+        )
+        # Zero out non-potential synapses.
+        init_perm = init_perm * potential_mask
+        init_perm = init_perm.clamp(0.0, 1.0)
+        self.permanences = nn.Parameter(init_perm)
+
+        # ---- buffers for homeostatic state (not learnable) ---------------------
+        self.register_buffer(
+            "active_duty_cycles",
+            torch.zeros(self.num_minicolumns),
+        )
+        self.register_buffer(
+            "overlap_duty_cycles",
+            torch.zeros(self.num_minicolumns),
+        )
+        self.register_buffer(
+            "boosting_factors",
+            torch.ones(self.num_minicolumns),
+        )
+        self.register_buffer("_step_count", torch.tensor(0, dtype=torch.long))
+
+    # ------------------------------------------------------------------
+    # Initialisation helpers
+    # ------------------------------------------------------------------
+
+    def _init_potential_mask(self, gen: torch.Generator) -> torch.Tensor:
+        """Build a binary mask of potential synapses for every minicolumn."""
+        mask = torch.zeros(self.num_minicolumns, self.input_size)
+        for col in range(self.num_minicolumns):
+            # Determine the "centre" input index for this column.
+            centre = int(col * self.input_size / self.num_minicolumns)
+            half_r = self.potential_radius // 2
+            lo = max(0, centre - half_r)
+            hi = min(self.input_size, centre + half_r + 1)
+            n_potential = max(1, int((hi - lo) * self.potential_pct))
+            # Randomly select ``n_potential`` indices in [lo, hi).
+            indices = torch.randperm(hi - lo, generator=gen)[:n_potential] + lo
+            mask[col, indices] = 1.0
+        return mask
+
+    # ------------------------------------------------------------------
+    # Differentiable connected mask
+    # ------------------------------------------------------------------
+
+    def _connected_mask(self) -> torch.Tensor:
+        """Soft approximation of the binary connected mask.
+
+        Uses a steep sigmoid centred at ``syn_perm_connected``.  In the
+        backward pass the sigmoid provides smooth gradients; in the forward
+        pass we further binarise via a straight-through estimator so that
+        downstream overlap is computed with exact 0/1 connections.
         """
-        Compute the overlap between the input vector and the minicolumn connections using einsum.
+        soft = torch.sigmoid(
+            self.sigmoid_sharpness * (self.permanences - self.syn_perm_connected)
+        )
+        # STE: hard threshold forward, sigmoid gradient backward.
+        hard = _ste_threshold(self.permanences - self.syn_perm_connected)
+        # Detach the hard part and add the soft part for gradient flow.
+        return hard.detach() + soft - soft.detach()
+
+    # ------------------------------------------------------------------
+    # Core forward logic
+    # ------------------------------------------------------------------
+
+    def compute_overlap(self, x: torch.Tensor) -> torch.Tensor:
+        """Compute overlap scores between input and connected synapses.
 
         Args:
-            input_vector (Union[np.ndarray, torch.Tensor]): The input vector of shape (batch_size, seq_len, input_size)
-                or (batch_size * seq_len, input_size).
+            x: (N, input_size)
 
         Returns:
-            Union[np.ndarray, torch.Tensor]: The overlap scores for each minicolumn of shape
-                (batch_size, seq_len, num_minicolumns) or (batch_size * seq_len, num_minicolumns).
+            overlap: (N, num_minicolumns)
         """
-        if isinstance(input_vector, torch.Tensor):
-            input_vector = input_vector.cpu().numpy()
-
-        input_shape = input_vector.shape
-        if len(input_shape) == 3:
-            batch_size, seq_len, input_size = input_shape
-            input_vector = input_vector.reshape(batch_size * seq_len, input_size)
-        elif len(input_shape) == 2:
-            batch_size_seq_len, input_size = input_shape
-        else:
-            raise ValueError(f"Invalid input shape: {input_shape}")
-
-        # Ensure the connections matrix has the correct shape
-        assert self.connections.shape == (
-            self.num_minicolumns,
-            input_size,
-        ), f"Connections matrix shape {self.connections.shape} does not match expected shape ({self.num_minicolumns}, {input_size})"
-
-        overlap = np.einsum("ij,kj->ik", input_vector, self.connections)
-
-        if len(input_shape) == 3:
-            overlap = overlap.reshape(batch_size, seq_len, self.num_minicolumns)
-        else:
-            overlap = overlap.reshape(batch_size_seq_len, self.num_minicolumns)
-
+        connected = self._connected_mask() * self.potential_mask
+        # overlap_ij = sum_k  x_{i,k} * connected_{j,k}
+        overlap = torch.mm(x, connected.t())  # (N, num_minicolumns)
         return overlap
 
-    def inhibit_columns(self, overlap: np.ndarray) -> np.ndarray:
-        """
-        Perform inhibition on the minicolumns based on the overlap scores.
+    def inhibit_columns(self, boosted_overlap: torch.Tensor) -> torch.Tensor:
+        """Top-k inhibition with straight-through estimator.
 
         Args:
-            overlap (np.ndarray): The overlap scores for each minicolumn of shape (batch_size, seq_len, num_minicolumns)
-                or (batch_size * seq_len, num_minicolumns).
+            boosted_overlap: (N, num_minicolumns)
 
         Returns:
-            np.ndarray: The active columns after inhibition of shape (batch_size, seq_len, num_minicolumns)
-                or (batch_size * seq_len, num_minicolumns).
+            active_mask: (N, num_minicolumns) -- binary {0, 1}
         """
-        input_shape = overlap.shape
-        if len(input_shape) == 3:
-            batch_size, seq_len, _ = input_shape
-            active_columns = np.zeros(
-                (batch_size, seq_len, self.num_minicolumns), dtype=bool
-            )
-        else:
-            batch_size_seq_len, _ = input_shape
-            active_columns = np.zeros(
-                (batch_size_seq_len, self.num_minicolumns), dtype=bool
-            )
-
         if self.global_inhibition:
-            num_active = np.minimum(
-                self.num_active_columns_per_inhibition_area, self.num_minicolumns
-            )
-            thresholds = np.partition(overlap, -num_active, axis=-1)[:, -num_active]
-            active_columns = overlap >= thresholds[:, np.newaxis]
+            active_mask = _ste_topk(boosted_overlap, self._num_active)
         else:
-            raise NotImplementedError("Local inhibition is not implemented.")
+            raise NotImplementedError("Local inhibition is not yet implemented.")
+        return active_mask
 
-        return active_columns
-
-    def update_permanences(
-            self, active_columns: np.ndarray, input_vector: np.ndarray
+    def _update_homeostasis(
+        self,
+        overlap: torch.Tensor,
+        active_mask: torch.Tensor,
     ) -> None:
+        """EMA duty-cycle update and exponential boosting (in-place, no grad).
+
+        Called during training only.
         """
-        Update the permanences of the synapses based on the active columns and input vector.
+        alpha = self._ema_alpha
+        n = overlap.shape[0]  # number of vectors in this batch
 
-        Args:
-            active_columns (np.ndarray): The active columns of shape (batch_size, seq_len, num_minicolumns)
-                or (batch_size * seq_len, num_minicolumns).
-            input_vector (np.ndarray): The input vector of shape (batch_size, seq_len, input_size)
-                or (batch_size * seq_len, input_size).
-        """
-        input_shape = input_vector.shape
-        if len(input_shape) == 3:
-            batch_size, seq_len, input_size = input_shape
-        elif len(input_shape) == 2:
-            batch_size_seq_len, input_size = input_shape
-        else:
-            raise ValueError(f"Invalid input shape: {input_shape}")
+        # Mean activity across the batch dimension.
+        batch_active_rate = active_mask.detach().mean(dim=0)          # (C,)
+        batch_overlap_rate = (overlap.detach() > 0).float().mean(0)   # (C,)
 
-        # Update the permanences for active columns
-        active_columns_indices = np.transpose(np.nonzero(active_columns))
-        for batch_seq_idx, col_idx in active_columns_indices:
-            if len(input_shape) == 3:
-                batch_idx, seq_idx = batch_seq_idx // seq_len, batch_seq_idx % seq_len
-                self.permanences[col_idx] += (
-                        self.syn_perm_active_inc * input_vector[batch_idx, seq_idx]
-                )
-            else:
-                self.permanences[col_idx] += (
-                        self.syn_perm_active_inc * input_vector[batch_seq_idx]
-                )
+        # EMA updates
+        self.active_duty_cycles.mul_(1.0 - alpha).add_(alpha * batch_active_rate)
+        self.overlap_duty_cycles.mul_(1.0 - alpha).add_(alpha * batch_overlap_rate)
+        self._step_count.add_(1)
 
-        # Decay the permanences for inactive columns
-        inactive_columns = ~active_columns
-        for batch_seq_idx in range(inactive_columns.shape[0]):
-            for col_idx in range(self.num_minicolumns):
-                if (
-                        inactive_columns[batch_seq_idx, col_idx]
-                        and self.connections[col_idx].any()
-                ):
-                    if len(input_shape) == 3:
-                        batch_idx, seq_idx = (
-                            batch_seq_idx // seq_len,
-                            batch_seq_idx % seq_len,
-                        )
-                        self.permanences[col_idx] -= self.syn_perm_inactive_dec
-                    else:
-                        self.permanences[col_idx] -= self.syn_perm_inactive_dec
+        # Target duty cycle
+        target_density = self.active_duty_cycles.mean().clamp(min=1e-6)
 
-        # Clip the permanences to the range [0, 1]
-        self.permanences = np.clip(self.permanences, 0, 1)
+        # Exponential boost: columns that fire less than the target get boosted.
+        self.boosting_factors = torch.exp(
+            self.max_boost * (target_density - self.active_duty_cycles)
+        ).clamp(1.0, self.max_boost)
 
-        # Update the connections based on the permanences
-        self.connections = np.where(
-            self.permanences >= self.syn_perm_connected, 1.0, 0.0
-        )
-
-    def update_duty_cycles(
-            self, overlap: np.ndarray, active_columns: np.ndarray
+    def _hebbian_permanence_update(
+        self,
+        active_mask: torch.Tensor,
+        x: torch.Tensor,
     ) -> None:
+        """Vectorised Hebbian permanence update (batched outer-product).
+
+        For every active column *c* and every input position *i*:
+          - if x_i == 1 (active input):   perm[c, i] += syn_perm_active_inc
+          - else:                         perm[c, i] -= syn_perm_inactive_dec
+
+        We accumulate the mean update across the batch so that permanences do
+        not explode with large batch sizes.
         """
-        Update the duty cycles of the minicolumns.
+        with torch.no_grad():
+            # active_mask: (N, C),  x: (N, input_size)
+            # We want a (C, input_size) update averaged over the batch.
+
+            # For active columns:  delta_pos = active_inc * x,  delta_neg = -inactive_dec * (1 - x)
+            # Weight by per-sample column activity.
+            # active_mask.t() @ x  -> (C, input_size): how many times each (col, input) pair co-activated
+            n = x.shape[0]
+            coactive = torch.mm(active_mask.t(), x) / n              # (C, input_size)
+            active_count = active_mask.sum(dim=0, keepdim=True).t() / n  # (C, 1)
+
+            inc = self.syn_perm_active_inc * coactive
+            dec = self.syn_perm_inactive_dec * (active_count - coactive)
+
+            delta = inc - dec  # (C, input_size)
+
+            # Only modify potential synapses.
+            delta = delta * self.potential_mask
+
+            self.permanences.data.add_(delta)
+            self.permanences.data.clamp_(0.0, 1.0)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Run the spatial pooler on a flat batch of input vectors.
 
         Args:
-            overlap (np.ndarray): The overlap scores for each minicolumn of shape (batch_size, seq_len, num_minicolumns)
-                or (batch_size * seq_len, num_minicolumns).
-            active_columns (np.ndarray): The active columns of shape (batch_size, seq_len, num_minicolumns)
-                or (batch_size * seq_len, num_minicolumns).
-        """
-        input_shape = overlap.shape
-        if len(input_shape) == 3:
-            batch_size, seq_len, _ = input_shape
-            overlap = overlap.reshape(batch_size * seq_len, self.num_minicolumns)
-            active_columns = active_columns.reshape(
-                batch_size * seq_len, self.num_minicolumns
-            )
-        else:
-            batch_size_seq_len, _ = input_shape
-
-        # Update the active duty cycles
-        self.active_duty_cycles = (
-                                          self.active_duty_cycles * (self.duty_cycle_period - 1)
-                                          + np.sum(active_columns, axis=0)
-                                  ) / self.duty_cycle_period
-
-        # Update the overlap duty cycles
-        self.overlap_duty_cycles = (
-                                           self.overlap_duty_cycles * (self.duty_cycle_period - 1)
-                                           + np.sum(overlap, axis=0)
-                                   ) / self.duty_cycle_period
-
-        # Update the minimum overlap duty cycles
-        self.min_overlap_duty_cycles = (
-                self.active_duty_cycles * self.min_pct_overlap_duty_cycle
-        )
-
-    def update_boosting_factors(self) -> None:
-        """
-        Update the boosting factors of the minicolumns.
-        """
-        self.boosting_factors = np.exp(
-            self.max_boost * (self.min_overlap_duty_cycles - self.overlap_duty_cycles)
-        ).clip(1, self.max_boost)
-
-    def compute(self, input_vector: np.ndarray) -> np.ndarray:
-        """
-        Compute the active columns for a given input vector.
-
-        Args:
-            input_vector (np.ndarray): The input vector of shape (batch_size, seq_len, input_size).
+            x: (N, input_size)   -- values in [0, 1] (or arbitrary real-valued)
 
         Returns:
-            np.ndarray: The active columns of shape (batch_size, seq_len, num_minicolumns)
-                or (batch_size * seq_len, num_minicolumns).
+            active_columns: (N, num_minicolumns) -- binary {0, 1}, differentiable.
         """
-        batch_size, seq_len, input_size = input_vector.shape
-        input_vector_reshaped = input_vector.reshape(batch_size * seq_len, input_size)
+        overlap = self.compute_overlap(x)                              # (N, C)
+        boosted_overlap = overlap * self.boosting_factors.unsqueeze(0)  # (N, C)
+        active_mask = self.inhibit_columns(boosted_overlap)            # (N, C)
 
-        overlap = self.compute_overlap(input_vector_reshaped)
-        active_columns = self.inhibit_columns(overlap * self.boosting_factors)
-        self.update_permanences(active_columns, input_vector_reshaped)
-        self.update_duty_cycles(overlap, active_columns)
-        self.update_boosting_factors()
+        # Homeostatic updates (only during training, no autograd).
+        if self.training:
+            self._update_homeostasis(overlap, active_mask)
+            self._hebbian_permanence_update(active_mask, x)
 
-        if len(input_vector_reshaped.shape) == 2:
-            active_columns = active_columns.reshape(
-                batch_size, seq_len, self.num_minicolumns
-            )
-        else:
-            active_columns = active_columns.reshape(
-                batch_size * seq_len, self.num_minicolumns
-            )
+        return active_mask
 
-        return active_columns
 
-    def forward(
-            self, input_vector: Union[np.ndarray, torch.Tensor]
-    ) -> Union[np.ndarray, torch.Tensor]:
-        """
-        Perform the forward pass of the spatial pooler.
-
-        Args:
-            input_vector (Union[np.ndarray, torch.Tensor]): The input vector of shape (batch_size, seq_len, input_size).
-
-        Returns:
-            Union[np.ndarray, torch.Tensor]: The active columns of shape (batch_size, seq_len, num_minicolumns)
-                or (batch_size * seq_len, num_minicolumns).
-        """
-        if isinstance(input_vector, torch.Tensor):
-            input_vector = input_vector.cpu().numpy()
-
-        active_columns = self.compute(input_vector)
-
-        if isinstance(input_vector, torch.Tensor):
-            if active_columns.ndim == 3:
-                active_columns = (
-                    torch.from_numpy(active_columns).float().to(input_vector.device)
-                )
-            else:
-                active_columns = (
-                    torch.from_numpy(active_columns)
-                    .float()
-                    .to(input_vector.device)
-                    .unsqueeze(1)
-                )
-
-        return active_columns
-
+# ---------------------------------------------------------------------------
+# HTMModel  -- wraps the spatial pooler for sequence-level processing
+# ---------------------------------------------------------------------------
 
 class HTMModel(nn.Module):
+    """High-level wrapper that:
+
+    1. Projects the input to the spatial-pooler's expected ``input_size``.
+    2. Runs the differentiable spatial pooler per time-step.
+    3. Projects the sparse column activations to ``sdr_dimensions``.
+    4. Adds a **residual connection** (through a matching linear projection
+       when dimensions differ) and applies **LayerNorm** for training
+       stability.
+    """
+
     def __init__(self, sdr_dimensions: int, device: torch.device, **kwargs):
         """
-        Initialize the HTMModel.
+        Initialise the HTMModel.
 
         Args:
-            sdr_dimensions (int): The dimensions of the Sparse Distributed Representation (SDR).
-            device (torch.device): The device to use for the model (e.g., torch.device('cuda') or torch.device('cpu')).
-            **kwargs: Additional arguments for the spatial pooler.
+            sdr_dimensions: Output dimensionality (SDR width).
+            device: Target device (e.g. ``torch.device('cuda')``).
+            **kwargs: All HTM spatial-pooler hyper-parameters.  See
+                :class:`HTMSpatialPooler` for the full list.
         """
-        super(HTMModel, self).__init__()
-        self.spatial_pooler = HTMSpatialPooler(**kwargs)
+        super().__init__()
+
         self.output_size = sdr_dimensions
         self.device = device
-        self.fc = nn.Linear(self.spatial_pooler.num_minicolumns, sdr_dimensions).to(
-            device
+
+        # Build the spatial pooler (extra kwargs like ``seq_len`` are
+        # harmlessly absorbed by HTMSpatialPooler.__init__).
+        self.spatial_pooler = HTMSpatialPooler(**kwargs)
+
+        sp_input_size: int = self.spatial_pooler.input_size
+        num_cols: int = self.spatial_pooler.num_minicolumns
+
+        # Input projection:  arbitrary feature dim -> sp_input_size
+        self.input_proj = nn.Linear(sp_input_size, sp_input_size)
+
+        # Output projection:  num_minicolumns -> sdr_dimensions
+        self.fc = nn.Linear(num_cols, sdr_dimensions)
+
+        # Residual projection (used when input dim != output dim).
+        if sp_input_size != sdr_dimensions:
+            self.residual_proj: Optional[nn.Module] = nn.Linear(
+                sp_input_size, sdr_dimensions
+            )
+        else:
+            self.residual_proj = None
+
+        # Layer normalisation for training stability.
+        self.layer_norm = nn.LayerNorm(sdr_dimensions)
+
+        # Move everything to the target device.
+        self.to(device)
+
+        logger.info(
+            f"HTMModel initialised: input_size={sp_input_size}, "
+            f"num_minicolumns={num_cols}, sdr_dimensions={sdr_dimensions}, "
+            f"device={device}"
         )
 
     def forward(self, input_sequence: torch.Tensor) -> torch.Tensor:
         """
-        Process the input sequence using the HTM model.
+        Process a batched sequence through the HTM spatial pooler.
 
         Args:
-            input_sequence (torch.Tensor): The sequence of input vectors of shape (batch_size, seq_len, input_size).
+            input_sequence: ``(batch, seq_len, input_size)``
 
         Returns:
-            torch.Tensor: The sequence of active columns of shape (batch_size, seq_len, num_minicolumns) or (batch_size * seq_len, num_minicolumns).
+            ``(batch, seq_len, sdr_dimensions)``
         """
         batch_size, seq_len, input_size = input_sequence.shape
-
-        # Resize the input sequence to match the expected input size
         expected_input_size = self.spatial_pooler.input_size
+
+        # Handle mismatched input feature dimension gracefully.
         if input_size != expected_input_size:
             logger.warning(
-                f"Input sequence feature size {input_size} does not match the expected input size {expected_input_size}. Resizing the input sequence."
+                f"Input feature size {input_size} != expected {expected_input_size}. "
+                f"Truncating / zero-padding to match."
             )
-            input_sequence = input_sequence[:, :, :expected_input_size]
+            if input_size > expected_input_size:
+                input_sequence = input_sequence[:, :, :expected_input_size]
+            else:
+                pad = torch.zeros(
+                    batch_size,
+                    seq_len,
+                    expected_input_size - input_size,
+                    device=input_sequence.device,
+                    dtype=input_sequence.dtype,
+                )
+                input_sequence = torch.cat([input_sequence, pad], dim=-1)
 
-        # Compute the active columns for the input sequence
-        active_columns = self.spatial_pooler.forward(input_sequence)
+        # Save residual *before* the spatial pooler.
+        residual = input_sequence  # (B, T, input_size)
 
-        # Convert active columns to a PyTorch tensor
-        if active_columns.ndim == 3:
-            active_columns_tensor = torch.tensor(
-                active_columns, dtype=torch.float32, device=self.device
-            )
-        else:
-            active_columns_tensor = torch.tensor(
-                active_columns, dtype=torch.float32, device=self.device
-            ).unsqueeze(1)
+        # Input projection (keeps same dim, adds learnable transform).
+        x = self.input_proj(input_sequence)  # (B, T, sp_input_size)
+
+        # Flatten batch & time, run SP, then reshape back.
+        x_flat = x.reshape(batch_size * seq_len, expected_input_size)
+        sp_out = self.spatial_pooler(x_flat)  # (B*T, num_minicolumns)
+        sp_out = sp_out.reshape(batch_size, seq_len, self.spatial_pooler.num_minicolumns)
+
+        # Project to SDR dimensions.
+        output = self.fc(sp_out)  # (B, T, sdr_dimensions)
+
+        # Residual connection.
+        if self.residual_proj is not None:
+            residual = self.residual_proj(residual)
+        output = output + residual
+
+        # LayerNorm for training stability.
+        output = self.layer_norm(output)
 
         logger.debug(
-            f"Performing HTM forward pass on input sequence of shape {input_sequence.shape}"
+            f"HTM forward: input {input_sequence.shape} -> output {output.shape}"
         )
-        logger.debug(self.inspect())
-
-        # Apply the fully connected layer
-        output = self.fc(active_columns_tensor)
-
-        if active_columns.ndim == 2:
-            output = output.squeeze(1)
 
         return output
 
     def inspect(self) -> dict:
-        """
-        View the HTM model parameters.
+        """Return a diagnostic dictionary of internal spatial-pooler state.
 
-        Returns:
-            dict: A dictionary containing the HTM model parameters.
+        All values are returned as detached CPU tensors (or Python scalars)
+        for easy inspection without interfering with autograd.
         """
-        inspection_data = {
-            "connections": self.spatial_pooler.connections,
-            "permanences": self.spatial_pooler.permanences,
-            "boosting_factors": self.spatial_pooler.boosting_factors,
-            "active_duty_cycles": self.spatial_pooler.active_duty_cycles,
-            "overlap_duty_cycles": self.spatial_pooler.overlap_duty_cycles,
-            "min_overlap_duty_cycles": self.spatial_pooler.min_overlap_duty_cycles,
-            "min_pct_overlap_duty_cycle": self.spatial_pooler.min_pct_overlap_duty_cycle,
-            "duty_cycle_period": self.spatial_pooler.duty_cycle_period,
-            "max_boost": self.spatial_pooler.max_boost,
-            "global_inhibition": self.spatial_pooler.global_inhibition,
-            "num_active_columns_per_inhibition_area": self.spatial_pooler.num_active_columns_per_inhibition_area,
+        sp = self.spatial_pooler
+        connected = (sp.permanences.data >= sp.syn_perm_connected).float()
+        return {
+            "connections": connected.detach().cpu(),
+            "permanences": sp.permanences.data.detach().cpu(),
+            "boosting_factors": sp.boosting_factors.detach().cpu(),
+            "active_duty_cycles": sp.active_duty_cycles.detach().cpu(),
+            "overlap_duty_cycles": sp.overlap_duty_cycles.detach().cpu(),
+            "min_overlap_duty_cycles": (
+                sp.active_duty_cycles * sp.min_pct_overlap_duty_cycle
+            ).detach().cpu(),
+            "min_pct_overlap_duty_cycle": sp.min_pct_overlap_duty_cycle,
+            "duty_cycle_period": sp.duty_cycle_period,
+            "max_boost": sp.max_boost,
+            "global_inhibition": sp.global_inhibition,
+            "num_active_columns_per_inhibition_area": sp.num_active_columns_per_inhibition_area,
+            "potential_mask": sp.potential_mask.detach().cpu(),
+            "sigmoid_sharpness": sp.sigmoid_sharpness,
+            "step_count": sp._step_count.item(),
         }
-        return inspection_data
