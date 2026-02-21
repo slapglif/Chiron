@@ -305,8 +305,10 @@ class HTMSpatialPooler(nn.Module):
             # Only modify potential synapses.
             delta = delta * self.potential_mask
 
-            self.permanences.data.add_(delta)
-            self.permanences.data.clamp_(0.0, 1.0)
+            # Fused add + clamp: single kernel launch instead of two separate
+            # kernel invocations (add_ then clamp_). This reduces CUDA kernel
+            # launch overhead and improves memory bandwidth utilization.
+            self.permanences.data = (self.permanences.data + delta).clamp_(0.0, 1.0)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Run the spatial pooler on a flat batch of input vectors.
