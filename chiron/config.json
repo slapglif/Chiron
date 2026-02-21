@@ -1,4 +1,9 @@
 {
+  "seed": 42,
+  "warmup_ratio": 0.1,
+  "weight_decay": 0.01,
+  "label_smoothing": 0.1,
+  "ema_decay": 0.999,
   "dataset_params": {
     "dataset_name": "teknium/OpenHermes-2.5",
     "dataset_config": "default",
@@ -50,7 +55,11 @@
     "input_size": 256,
     "hidden_size": 64,
     "output_size": 128,
-    "timesteps": 10
+    "timesteps": 10,
+    "dropout": 0.1,
+    "recurrent": true,
+    "surrogate_slope": 25.0,
+    "adaptive_threshold": true
   },
   "gat_params": {
     "in_features": 128,
@@ -68,7 +77,7 @@
   "adjacency_matrix": {
     "threshold": 0.5,
     "batch_size": 100,
-    "top_k": 1000,
+    "top_k": 50,
     "output_file_prefix": "adjacency_matrix_batch_",
     "output_file": "output/adj_matrix.npz",
     "similarity_batch_size": 100
@@ -82,5 +91,5 @@
   "tokenizer": {
     "name": "bert-base-uncased"
   },
-  "neptune_key": "eyJhcGlfYWRkcmVzcyI6Imh0dHBzOi8vYXBwLm5lcHR1bmUuYWkiLCJhcGlfdXJsIjoiaHR0cHM6Ly9hcHAubmVwdHVuZS5haSIsImFwaV9rZXkiOiJlMGQ3MmY2OC01YjA4LTRkYjctOTIyMy1kZDA1ZjdjYmMyYzEifQ==\""
+  "neptune_key": ""
 }
