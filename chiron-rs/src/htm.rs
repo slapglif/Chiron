@@ -22,12 +22,32 @@
 //! - [`HtmModel::forward`] pads/truncates the incoming features to
 //!   `input_size` with a single zero-alloc + block copy (the hot path:
 //!   64-dim GAT output into a 128-wide pooler).
+//! - **Degenerate-inhibition inference fast path**: with the default
+//!   config (`input_size=128`, `minicolumn_size=16` → 8 minicolumns,
+//!   `num_active = min(10, 8) = 8`) the top-k inhibition selects *every*
+//!   column, so the active mask is a constant all-ones matrix for any
+//!   input. At inference the whole pooler (and the `input_proj` GEMM
+//!   feeding it) therefore collapses to a constant vector
+//!   `fc(all-ones) = column-sums of fc.weight + fc.bias`, which
+//!   [`HtmModel::forward`] caches and adds straight onto the residual
+//!   path. Detected at runtime via
+//!   [`HtmSpatialPooler::is_inhibition_degenerate`], never assumed.
+//! - **Sparse top-k output projection**: the pooler output is binary with
+//!   exactly `k = num_active` ones per row, so the `fc` GEMM
+//!   (O(C·sdr) per row) is replaced at inference by accumulating the `k`
+//!   active weight rows: `out = bias + Σ fc.weight.row(c)` — O(k·sdr).
+//! - **Sparse connected-overlap (gated)**: the connected matrix is
+//!   typically ~20% dense (`potential_pct 0.5` × ~50% of permanences
+//!   above threshold). When density < 0.25 *and* `num_minicolumns >= 32`,
+//!   a CSR index list per minicolumn is built alongside the dense cache
+//!   and the overlap becomes a rayon-parallel sparse gather instead of a
+//!   GEMM. Rebuilt together with the dense cache after Hebbian updates.
 //!
 //! Deterministic given `HtmParams::seed` (potential masks via a seeded
 //! partial Fisher-Yates shuffle; permanences via seeded uniform draws).
 
 use ndarray::parallel::prelude::*;
-use ndarray::{s, Array1, Array2, ArrayView2, Axis, Zip};
+use ndarray::{s, Array1, Array2, ArrayView2, Axis, CowArray, Ix2, Zip};
 use rand::rngs::StdRng;
 use rand::Rng;
 
@@ -87,6 +107,24 @@ impl Default for HtmParams {
 // HtmSpatialPooler
 // ---------------------------------------------------------------------------
 
+/// Maximum density of the connected matrix for the sparse-overlap path.
+const SPARSE_OVERLAP_MAX_DENSITY: f32 = 0.25;
+/// Minimum minicolumn count for the sparse-overlap path (a GEMM against
+/// 8 columns is already trivially cheap; sparse bookkeeping only pays off
+/// once the column axis is wide).
+const SPARSE_OVERLAP_MIN_COLUMNS: usize = 32;
+
+/// CSR index of the connected matrix, over minicolumns: for minicolumn
+/// `c`, the connected input indices are
+/// `indices[indptr[c]..indptr[c + 1]]` (all weights are exactly `1.0`,
+/// so only indices are stored). Built by
+/// [`HtmSpatialPooler::rebuild_connected`] when the density/size gate
+/// passes, and rebuilt whenever the dense cache is rebuilt.
+struct ConnectedCsr {
+    indptr: Vec<usize>,
+    indices: Vec<u32>,
+}
+
 /// HTM spatial pooler with global inhibition, boosting and Hebbian learning.
 pub struct HtmSpatialPooler {
     pub input_size: usize,
@@ -108,6 +146,10 @@ pub struct HtmSpatialPooler {
     /// Cached connected matrix, stored transposed `(input_size, C)` so the
     /// overlap is one GEMM. Rebuilt only when permanences change.
     connected_t: Array2<f32>,
+    /// Sparse (CSR) view of `connected_t`, present only when the connected
+    /// matrix is sparse enough and wide enough to beat the dense GEMM
+    /// (see [`SPARSE_OVERLAP_MAX_DENSITY`] / [`SPARSE_OVERLAP_MIN_COLUMNS`]).
+    connected_csr: Option<ConnectedCsr>,
 }
 
 impl HtmSpatialPooler {
@@ -177,15 +219,23 @@ impl HtmSpatialPooler {
             boosting_factors: Array1::ones(num_minicolumns),
             step_count: 0,
             connected_t: Array2::zeros((input_size, num_minicolumns)),
+            connected_csr: None,
         };
         pooler.rebuild_connected();
         pooler
     }
 
-    /// Rebuild the cached transposed connected matrix from permanences.
+    /// Rebuild the cached transposed connected matrix from permanences,
+    /// plus its CSR companion when the sparse-overlap gate passes
+    /// (density < [`SPARSE_OVERLAP_MAX_DENSITY`] and at least
+    /// [`SPARSE_OVERLAP_MIN_COLUMNS`] minicolumns).
     fn rebuild_connected(&mut self) {
         let thr = self.syn_perm_connected;
-        let mut ct = Array2::<f32>::zeros((self.input_size, self.num_minicolumns));
+        let c_count = self.num_minicolumns;
+        let mut ct = Array2::<f32>::zeros((self.input_size, c_count));
+        let mut indptr = Vec::with_capacity(c_count + 1);
+        let mut indices = Vec::new();
+        indptr.push(0usize);
         for (c, (perm_row, mask_row)) in self
             .permanences
             .rows()
@@ -196,10 +246,56 @@ impl HtmSpatialPooler {
             for (i, (&p, &m)) in perm_row.iter().zip(mask_row).enumerate() {
                 if p >= thr && m > 0.0 {
                     ct[[i, c]] = 1.0;
+                    indices.push(i as u32);
                 }
             }
+            indptr.push(indices.len());
         }
+        let density = indices.len() as f32 / (self.input_size * c_count) as f32;
+        self.connected_csr = (density < SPARSE_OVERLAP_MAX_DENSITY
+            && c_count >= SPARSE_OVERLAP_MIN_COLUMNS)
+            .then_some(ConnectedCsr { indptr, indices });
         self.connected_t = ct;
+    }
+
+    /// True iff top-k inhibition is **degenerate**: `num_active ==
+    /// num_minicolumns`, so the "top k of k" winners are all columns and
+    /// the active mask is a constant all-ones matrix for every input.
+    ///
+    /// This holds for the default config: `input_size=128`,
+    /// `minicolumn_size=16` → 8 minicolumns, and
+    /// `num_active_columns_per_inhibition_area=10` clamps to
+    /// `min(10, 8) = 8` winners of 8. In that regime the pooler output
+    /// carries no information about the input, and [`HtmModel`] replaces
+    /// the whole pooler stage with a cached constant at inference. The
+    /// degeneracy is config-dependent, so callers must check this rather
+    /// than assume it.
+    pub fn is_inhibition_degenerate(&self) -> bool {
+        self.num_active == self.num_minicolumns
+    }
+
+    /// Boosted-input overlap `(N, C)`: dense GEMM `x @ connected_t`, or a
+    /// rayon-parallel sparse gather over the CSR index when the connected
+    /// matrix is sparse/wide enough (no allocation in the inner loop).
+    fn compute_overlap(&self, x: &ArrayView2<f32>) -> Array2<f32> {
+        match &self.connected_csr {
+            None => x.dot(&self.connected_t),
+            Some(csr) => {
+                let mut overlap = Array2::<f32>::zeros((x.nrows(), self.num_minicolumns));
+                Zip::from(overlap.rows_mut())
+                    .and(x.rows())
+                    .par_for_each(|mut orow, xrow| {
+                        for (c, o) in orow.iter_mut().enumerate() {
+                            let mut acc = 0.0_f32;
+                            for &i in &csr.indices[csr.indptr[c]..csr.indptr[c + 1]] {
+                                acc += xrow[i as usize];
+                            }
+                            *o = acc;
+                        }
+                    });
+                overlap
+            }
+        }
     }
 
     /// Effective binary connected mask `(C, input_size)` (forward value of
@@ -301,7 +397,7 @@ impl HtmSpatialPooler {
             self.input_size,
             x.ncols()
         );
-        let overlap = x.dot(&self.connected_t); // (N, C) — single GEMM
+        let overlap = self.compute_overlap(x); // (N, C) — GEMM or sparse gather
         let active = self.select_active(&overlap);
         if training && overlap.nrows() > 0 {
             self.update_homeostasis(&overlap, &active);
@@ -318,6 +414,15 @@ impl HtmSpatialPooler {
 /// High-level wrapper: pad/project the input to the pooler width, run the
 /// spatial pooler, project the column activations to `sdr_dimensions`, add
 /// a residual path, and LayerNorm.
+///
+/// Inference fast paths (training always runs the full pipeline so
+/// plasticity statistics keep updating):
+/// - When [`HtmSpatialPooler::is_inhibition_degenerate`] (default config:
+///   `min(10, 8) = 8` winners of 8 columns ⇒ constant all-ones mask), the
+///   `input_proj` GEMM and the pooler are skipped entirely and the cached
+///   constant `fc(all-ones)` is added onto the residual path.
+/// - Otherwise the dense `fc` GEMM is replaced by O(k·sdr) sparse
+///   accumulation over the `k = num_active` active columns per row.
 pub struct HtmModel {
     pub spatial_pooler: HtmSpatialPooler,
     pub sdr_dimensions: usize,
@@ -325,6 +430,11 @@ pub struct HtmModel {
     fc: Linear,
     residual_proj: Option<Linear>,
     layer_norm: LayerNorm,
+    /// Lazily-built cache of `fc(all-ones)` = per-output column-sums of
+    /// `fc.weight` plus `fc.bias`, used by the degenerate-inhibition
+    /// inference fast path. `fc` weights are fixed at inference, so the
+    /// cache never needs invalidation there.
+    fc_const: Option<Array1<f32>>,
 }
 
 impl HtmModel {
