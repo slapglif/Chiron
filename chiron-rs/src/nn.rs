@@ -144,7 +144,7 @@ pub fn leaky_relu(x: f32, alpha: f32) -> f32 {
 /// Tanh-approximation GELU (matches PyTorch `nn.GELU()` closely).
 #[inline(always)]
 pub fn gelu(x: f32) -> f32 {
-    const SQRT_2_OVER_PI: f32 = 0.797_884_56;
+    const SQRT_2_OVER_PI: f32 = 0.797_884_6;
     0.5 * x * (1.0 + (SQRT_2_OVER_PI * (x + 0.044_715 * x * x * x)).tanh())
 }
 
@@ -186,15 +186,17 @@ pub fn orthogonal(dim: usize, gain: f32, rng: &mut StdRng) -> Array2<f32> {
         .map(|_| (0..dim).map(|_| normal.sample(rng)).collect())
         .collect();
     for i in 0..dim {
-        for j in 0..i {
-            let dot: f32 = (0..dim).map(|k| m[i][k] * m[j][k]).sum();
-            for k in 0..dim {
-                m[i][k] -= dot * m[j][k];
+        let (prev, rest) = m.split_at_mut(i);
+        let row_i = &mut rest[0];
+        for row_j in prev.iter() {
+            let dot: f32 = row_i.iter().zip(row_j).map(|(a, b)| a * b).sum();
+            for (a, b) in row_i.iter_mut().zip(row_j) {
+                *a -= dot * b;
             }
         }
-        let norm: f32 = m[i].iter().map(|v| v * v).sum::<f32>().sqrt().max(1e-8);
-        for k in 0..dim {
-            m[i][k] = m[i][k] / norm * gain;
+        let norm: f32 = row_i.iter().map(|v| v * v).sum::<f32>().sqrt().max(1e-8);
+        for v in row_i.iter_mut() {
+            *v = *v / norm * gain;
         }
     }
     Array2::from_shape_fn((dim, dim), |(i, j)| m[i][j])

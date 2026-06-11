@@ -60,7 +60,13 @@ fn bench_sdr() {
 fn bench_adjacency() {
     let mut rng = seeded_rng(2);
     let n = 1024;
-    let emb = Array2::from_shape_fn((n, 256), |_| rng.gen_range(-1.0_f32..1.0));
+    // Clustered embeddings (32 centroids + noise) so the 0.5 cosine
+    // threshold keeps realistic neighbourhoods; i.i.d. uniform vectors in
+    // 256-d are near-orthogonal and would yield an empty adjacency.
+    let centroids = Array2::from_shape_fn((32, 256), |_| rng.gen_range(-1.0_f32..1.0));
+    let emb = Array2::from_shape_fn((n, 256), |(i, j)| {
+        centroids[(i % 32, j)] + rng.gen_range(-0.4_f32..0.4)
+    });
 
     let t0 = Instant::now();
     let adj = CsrMatrix::cosine_adjacency(&emb.view(), 0.5, 50);
