@@ -61,6 +61,44 @@ attention output (pure residual pathway). The Python masks with `dtype.min`,
 which degenerates to *uniform attention over all nodes* for isolated rows — an
 artifact of finite masking, not intent.
 
+## Sparsity engine
+
+The dominant intermediate signal is the SNN spike cube `(N, T, 128)`.
+Three measured facts drive the sparse execution paths (`SparsityConfig`):
+
+1. **Spikes are binary and LayerNorm of a binary vector takes exactly two
+   values per row**, fully determined by the spike count (mean `m = k/dim`,
+   `var = m(1-m)`). The cube is therefore carried as bit-packed `u64` masks
+   (16 B per row instead of 512 B, 32x), and every downstream
+   `Linear(LayerNorm(spikes))` collapses *exactly* into a sparse accumulation
+   of pre-scaled weight rows plus a rank-1 correction derived from popcount
+   (`SpikeTrain`, `SnnLayer::forward_events`,
+   `TemporalAttention::forward_events`). Measured spike density ramps
+   4.7% (t=0) to ~47% (t=9) as the ALIF adaptation engages.
+2. **The HTM inhibition is degenerate at config dimensions**: it selects
+   `min(10, 8) = 8` winners out of 8 minicolumns, so the active mask is
+   constant all-ones and at inference the entire pooler collapses to a
+   precomputed constant vector + residual projection (detected via
+   `is_inhibition_degenerate()`, ~2.5x on the HTM stage; training keeps the
+   full plasticity path). Non-degenerate configs get O(k·sdr) sparse output
+   projection and CSR connected-overlap instead.
+3. **Chunked fused execution**: input-proj -> SNN -> temporal attention run
+   chunk-by-chunk (default 2048 rows), bounding the live working set instead
+   of streaming the full float cube through DRAM twice.
+
+Presets: `SparsityConfig::exact()` (dense reference),
+`aggressive()` (everything above — **no approximation**, output cosine
+1.0000 vs exact), `extreme()` (adds 25%-kept CSR recurrent weights — the
+one lossy knob, cosine ~0.86).
+
+**Negative result, kept for honesty:** magnitude-pruning the recurrent
+membrane GEMM to CSR does *not* pay at these dimensions. At 50% kept
+weights the gather-bound CSR matvec loses outright to the SIMD dense GEMM,
+and even at 25% it merely breaks even while costing 0.86 fidelity — so
+`aggressive()` keeps the recurrent GEMM dense. The recurrence is the
+irreducible core: 10 sequential timesteps of `mem @ W_rec` on a dense
+membrane state.
+
 ## Measured throughput
 
 4 threads, `--release` (lto=fat, codegen-units=1), config.json dimensions:
@@ -75,21 +113,28 @@ artifact of finite masking, not intent.
 [BitSdr overlap]  256-bit packed SDR popcount similarity
   226.5 M pairs/sec
 
-[Pipeline]  batch=32 seq=128 (4096 tokens/pass)
-  input projection           1.54 ms     2,666,762 tokens/sec
-  SNN (10 timesteps)        89.32 ms        45,858 tokens/sec
-  temporal attention        38.10 ms       107,496 tokens/sec
-  GATv2 + skip + mask       16.71 ms       245,151 tokens/sec
-  HTM + skip                12.57 ms       325,942 tokens/sec
-  gather + MLP head          0.35 ms    11,765,064 tokens/sec
-  TOTAL                    158.58 ms        25,829 tokens/sec
+[Pipeline]  batch=32 seq=128         exact      sparse-exact   speedup
+  input projection                  1.88 ms        2.15 ms      0.9x
+  SNN (10 timesteps)               92.40 ms       58.12 ms      1.6x
+  temporal attention               50.07 ms       10.79 ms      4.6x
+  GATv2 + skip + mask              25.62 ms       25.75 ms      1.0x
+  HTM + skip                       13.65 ms       11.32 ms      1.2x
+  gather + MLP head                 0.44 ms        0.42 ms      1.0x
+  TOTAL                           202.02 ms      108.85 ms      1.9x
+  output cosine vs exact:                          1.0000
+
+[Pipeline]  batch=64 seq=256         exact      sparse-exact   speedup
+  SNN (10 timesteps)              420.51 ms      248.39 ms      1.7x
+  temporal attention              279.48 ms       44.46 ms      6.3x
+  TOTAL                           878.86 ms      430.74 ms      2.0x
+  output cosine vs exact:                          1.0000
 ```
 
-The SNN dominates (~56% of wall time): its cost is inherent — 10 sequential
-timesteps × (recurrent GEMM + projection GEMM + LayerNorm) that cannot be
-batched across time because of the membrane-state dependency. Temporal
-attention is the next-largest term and is GEMM-bound (key projection over
-N·T rows). Reproduce with:
+After sparsification the irreducible bottleneck is the SNN's recurrent
+membrane GEMM: 10 sequential timesteps of `mem @ W_rec` over a dense float
+membrane state — it cannot be event-driven (membranes are not binary) and
+CSR pruning measurably loses to the dense GEMM (see above). Everything
+around it has been sparsified exactly. Reproduce with:
 
 ```bash
 cd chiron-rs

@@ -13,7 +13,7 @@ use std::time::Instant;
 use ndarray::Array2;
 use rand::Rng;
 
-use chiron_core::model::{LayerTimings, ModelConfig, SnnModel};
+use chiron_core::model::{LayerTimings, ModelConfig, SnnModel, SparsityConfig};
 use chiron_core::nn::seeded_rng;
 use chiron_core::sdr::{pack_batch, SdrGenerator};
 use chiron_core::sparse::CsrMatrix;
@@ -139,15 +139,84 @@ fn run_pipeline_case(batch: usize, seq: usize) {
     }
     let adj = CsrMatrix::from_dense(&dense.view());
 
-    let mut model = SnnModel::new(ModelConfig::default());
+    println!(
+        "[Pipeline]  batch={batch} seq={seq}  ({} tokens/pass, adjacency nnz={})",
+        batch * seq,
+        adj.nnz()
+    );
+
+    let exact_out = run_config(
+        "exact (dense)",
+        ModelConfig::default(),
+        batch,
+        seq,
+        &ids,
+        &mask,
+        &adj,
+        &nodes,
+    );
+    let sparse_out = run_config(
+        "sparse-exact (event-driven, dense recurrent, chunked)",
+        ModelConfig {
+            sparsity: SparsityConfig::aggressive(),
+            ..Default::default()
+        },
+        batch,
+        seq,
+        &ids,
+        &mask,
+        &adj,
+        &nodes,
+    );
+    let extreme_out = run_config(
+        "sparse-extreme (event-driven, rec keep 25% CSR, chunked)",
+        ModelConfig {
+            sparsity: SparsityConfig::extreme(),
+            ..Default::default()
+        },
+        batch,
+        seq,
+        &ids,
+        &mask,
+        &adj,
+        &nodes,
+    );
+
+    let cosine = |a: &Array2<f32>, b: &Array2<f32>| {
+        let dot: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
+        let na: f32 = a.iter().map(|v| v * v).sum::<f32>().sqrt();
+        let nb: f32 = b.iter().map(|v| v * v).sum::<f32>().sqrt();
+        dot / (na * nb).max(1e-12)
+    };
+    println!(
+        "  fidelity vs exact: sparse-exact cosine = {:.4}, sparse-extreme cosine = {:.4}\n",
+        cosine(&exact_out, &sparse_out),
+        cosine(&exact_out, &extreme_out)
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_config(
+    label: &str,
+    cfg: ModelConfig,
+    batch: usize,
+    seq: usize,
+    ids: &Array2<f32>,
+    mask: &Array2<f32>,
+    adj: &CsrMatrix,
+    nodes: &[usize],
+) -> Array2<f32> {
+    let mut model = SnnModel::new(cfg);
     // warmup
-    let _ = model.forward(&ids.view(), &mask.view(), Some(&adj), &nodes, false);
+    let _ = model.forward(&ids.view(), &mask.view(), Some(adj), nodes, false);
 
     let iters = 5;
     let mut sum = LayerTimings::default();
+    let mut last = Array2::<f32>::zeros((0, 0));
     for _ in 0..iters {
-        let (out, t) = model.forward_timed(&ids.view(), &mask.view(), Some(&adj), &nodes, false);
+        let (out, t) = model.forward_timed(&ids.view(), &mask.view(), Some(adj), nodes, false);
         std::hint::black_box(&out);
+        last = out;
         sum.input_projection += t.input_projection;
         sum.snn += t.snn;
         sum.temporal_attention += t.temporal_attention;
@@ -159,11 +228,7 @@ fn run_pipeline_case(batch: usize, seq: usize) {
     let inv = 1.0 / iters as f64;
     let tokens = (batch * seq) as f64;
 
-    println!(
-        "[Pipeline]  batch={batch} seq={seq}  ({} tokens/pass, adjacency nnz={})",
-        batch * seq,
-        adj.nnz()
-    );
+    println!("  --- {label} ---");
     let row = |name: &str, secs: f64| {
         println!(
             "  {:<22} {:>9.3} ms   {:>12.0} tokens/sec",
@@ -179,5 +244,5 @@ fn run_pipeline_case(batch: usize, seq: usize) {
     row("HTM + skip", sum.htm);
     row("gather + MLP head", sum.head);
     row("TOTAL", sum.total);
-    println!();
+    last
 }

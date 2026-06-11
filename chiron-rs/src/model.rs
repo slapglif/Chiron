@@ -33,6 +33,72 @@ pub struct ModelConfig {
     pub gat_concat: bool,
     pub htm: HtmParams,
     pub seed: u64,
+    pub sparsity: SparsityConfig,
+}
+
+/// Controls the sparse / approximate execution paths.
+///
+/// The pipeline's intermediate signal is dominated by the SNN spike cube
+/// `(N, T, 128)`. Spikes are binary and LayerNorm of a binary vector takes
+/// only two values per row, so the cube can be carried as bit-packed masks
+/// (~30x smaller) and every downstream projection becomes a sparse
+/// accumulation of weight rows plus a rank-1 correction — exactly.
+/// The only *approximation* is `recurrent_keep < 1.0`, which magnitude-prunes
+/// the recurrent membrane weights (the one inherently dense GEMM left).
+#[derive(Clone, Copy, Debug)]
+pub struct SparsityConfig {
+    /// Run the SNN + temporal attention via bit-packed spike events.
+    pub event_driven_snn: bool,
+    /// Fraction of recurrent weights kept (by magnitude). 1.0 = exact.
+    pub recurrent_keep: f32,
+    /// Rows per chunk for the fused input-proj -> SNN -> temporal-attention
+    /// stage; bounds the live spike-cube working set. 0 disables chunking.
+    pub chunk_rows: usize,
+}
+
+impl SparsityConfig {
+    /// Bit-exact reference execution (dense paths everywhere).
+    pub fn exact() -> Self {
+        Self {
+            event_driven_snn: false,
+            recurrent_keep: 1.0,
+            chunk_rows: 0,
+        }
+    }
+
+    /// Everything that is *exactly* sparsifiable, sparsified: bit-packed
+    /// spike events, popcount-derived LayerNorm, sparse-accumulated
+    /// projections, chunked execution. The recurrent membrane GEMM stays
+    /// dense — measured on CPU, a CSR matvec at 50% kept weights *loses*
+    /// to the SIMD dense GEMM (gather-bound), and the keep ratios where
+    /// CSR wins (<= ~25%) cost too much fidelity for a default.
+    /// Output matches [`Self::exact`] to float-summation tolerance.
+    pub fn aggressive() -> Self {
+        Self {
+            event_driven_snn: true,
+            recurrent_keep: 1.0,
+            chunk_rows: 2048,
+        }
+    }
+
+    /// [`Self::aggressive`] plus magnitude-pruned recurrent weights at 25%
+    /// kept entries — the density where the CSR matvec actually beats the
+    /// dense GEMM on CPU. This is a lossy approximation: ~72% of the
+    /// recurrent matrix energy is retained and the output cosine vs exact
+    /// is ~0.85 (the discrete spike threshold amplifies drive error).
+    pub fn extreme() -> Self {
+        Self {
+            event_driven_snn: true,
+            recurrent_keep: 0.25,
+            chunk_rows: 2048,
+        }
+    }
+}
+
+impl Default for SparsityConfig {
+    fn default() -> Self {
+        Self::exact()
+    }
 }
 
 impl Default for ModelConfig {
@@ -49,6 +115,7 @@ impl Default for ModelConfig {
             gat_concat: true,
             htm: HtmParams::default(),
             seed: 42,
+            sparsity: SparsityConfig::default(),
         }
     }
 }
@@ -121,6 +188,11 @@ impl SnnModel {
         let mlp_hidden = (output_size / 2).max(64);
         let mlp_head = MlpHead::new(output_size, mlp_hidden, output_size, &mut rng);
 
+        let mut snn_layer = snn_layer;
+        if cfg.sparsity.recurrent_keep < 1.0 {
+            snn_layer.prune_recurrent(cfg.sparsity.recurrent_keep);
+        }
+
         Self {
             cfg,
             input_projection,
@@ -182,26 +254,69 @@ impl SnnModel {
         let mut t = LayerTimings::default();
         let t_all = Instant::now();
 
-        // 1. Learned input embedding: each scalar id -> snn_input_size vector.
-        let t0 = Instant::now();
         let ids_col = input_ids
             .to_owned()
             .into_shape_with_order((flat, 1))
             .expect("input reshape");
-        let mut x = self.input_projection.forward(&ids_col.view()); // (flat, in)
-        self.input_ln.forward_inplace(x.view_mut());
-        t.input_projection = t0.elapsed().as_secs_f64();
 
-        // 2. SNN layer over timesteps.
-        let t0 = Instant::now();
-        let snn_raw: Array3<f32> = self.snn_layer.forward(&x.view()); // (flat, T, out)
-        t.snn = t0.elapsed().as_secs_f64();
+        // Stages 1-3: input embedding -> SNN -> temporal attention.
+        //
+        // Event-driven path: the three stages are fused and run chunk by
+        // chunk so the live spike representation never exceeds
+        // chunk_rows * T * dim/8 bytes (bit-packed), instead of the dense
+        // (flat, T, dim) f32 cube. Each chunk's spikes flow straight into
+        // temporal attention while still hot in cache.
+        let mut snn_output = if self.cfg.sparsity.event_driven_snn {
+            let chunk = match self.cfg.sparsity.chunk_rows {
+                0 => flat,
+                c => c,
+            };
+            let mut out = Array2::<f32>::zeros((flat, self.cfg.snn_output_size));
+            let mut start = 0;
+            while start < flat {
+                let end = (start + chunk).min(flat);
+                let ids_chunk = ids_col.slice(ndarray::s![start..end, ..]);
 
-        // 3. Temporal attention collapses the timestep axis.
+                let t0 = Instant::now();
+                let mut x = self.input_projection.forward(&ids_chunk);
+                self.input_ln.forward_inplace(x.view_mut());
+                t.input_projection += t0.elapsed().as_secs_f64();
+
+                let t0 = Instant::now();
+                let spikes = self.snn_layer.forward_events(&x.view());
+                t.snn += t0.elapsed().as_secs_f64();
+
+                let t0 = Instant::now();
+                let ta = self
+                    .temporal_attention
+                    .forward_events(&spikes, self.snn_layer.ln2());
+                out.slice_mut(ndarray::s![start..end, ..]).assign(&ta);
+                t.temporal_attention += t0.elapsed().as_secs_f64();
+
+                start = end;
+            }
+            out
+        } else {
+            // 1. Learned input embedding: each scalar id -> vector.
+            let t0 = Instant::now();
+            let mut x = self.input_projection.forward(&ids_col.view()); // (flat, in)
+            self.input_ln.forward_inplace(x.view_mut());
+            t.input_projection = t0.elapsed().as_secs_f64();
+
+            // 2. SNN layer over timesteps.
+            let t0 = Instant::now();
+            let snn_raw: Array3<f32> = self.snn_layer.forward(&x.view()); // (flat, T, out)
+            t.snn = t0.elapsed().as_secs_f64();
+
+            // 3. Temporal attention collapses the timestep axis.
+            let t0 = Instant::now();
+            let out = self.temporal_attention.forward(&snn_raw.view()); // (flat, out)
+            t.temporal_attention = t0.elapsed().as_secs_f64();
+            out
+        };
         let t0 = Instant::now();
-        let mut snn_output = self.temporal_attention.forward(&snn_raw.view()); // (flat, out)
         self.post_snn_ln.forward_inplace(snn_output.view_mut());
-        t.temporal_attention = t0.elapsed().as_secs_f64();
+        t.temporal_attention += t0.elapsed().as_secs_f64();
 
         // 4. GATv2 over the adjacency graph (per batch element).
         let t0 = Instant::now();
@@ -319,6 +434,70 @@ mod tests {
         let y = m.forward(&ids.view(), &mask.view(), Some(&csr), &nodes, false);
         assert_eq!(y.dim(), (b, 256));
         assert!(y.iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn event_driven_path_matches_dense_path() {
+        let (b, s) = (4, 16);
+        let ids = Array2::from_shape_fn((b, s), |(i, j)| ((i * 17 + j * 5) % 503) as f32);
+        let mask = Array2::<f32>::ones((b, s));
+        let nodes = vec![1usize; b];
+
+        let mut dense = SnnModel::new(small_cfg());
+        let mut sparse_cfg = small_cfg();
+        sparse_cfg.sparsity = SparsityConfig {
+            event_driven_snn: true,
+            recurrent_keep: 1.0, // no approximation: must match the dense path
+            chunk_rows: 16,      // force several chunks
+        };
+        let mut sparse = SnnModel::new(sparse_cfg);
+
+        let yd = dense.forward(&ids.view(), &mask.view(), None, &nodes, false);
+        let ys = sparse.forward(&ids.view(), &mask.view(), None, &nodes, false);
+        let max_abs = yd
+            .iter()
+            .zip(ys.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f32, f32::max);
+        assert!(
+            max_abs < 1e-3,
+            "event-driven path deviates from dense: max abs diff {max_abs}"
+        );
+    }
+
+    #[test]
+    fn aggressive_sparsity_stays_faithful() {
+        let (b, s) = (4, 16);
+        let ids = Array2::from_shape_fn((b, s), |(i, j)| ((i * 29 + j * 3) % 701) as f32);
+        let mask = Array2::<f32>::ones((b, s));
+        let nodes = vec![0usize; b];
+
+        let mut dense = SnnModel::new(small_cfg());
+        let mut agg_cfg = small_cfg();
+        agg_cfg.sparsity = SparsityConfig::aggressive();
+        let mut sparse = SnnModel::new(agg_cfg);
+        let mut ext_cfg = small_cfg();
+        ext_cfg.sparsity = SparsityConfig::extreme();
+        let mut extreme = SnnModel::new(ext_cfg);
+
+        let cosine = |a: &Array2<f32>, b: &Array2<f32>| {
+            let dot: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
+            let na: f32 = a.iter().map(|v| v * v).sum::<f32>().sqrt();
+            let nb: f32 = b.iter().map(|v| v * v).sum::<f32>().sqrt();
+            dot / (na * nb).max(1e-12)
+        };
+
+        let yd = dense.forward(&ids.view(), &mask.view(), None, &nodes, false);
+
+        // aggressive() contains no approximation: must match near-exactly.
+        let ya = sparse.forward(&ids.view(), &mask.view(), None, &nodes, false);
+        let cos_a = cosine(&yd, &ya);
+        assert!(cos_a > 0.999, "aggressive (exact-sparse) diverged: cosine {cos_a}");
+
+        // extreme() prunes recurrent weights to 25%: lossy but bounded.
+        let ye = extreme.forward(&ids.view(), &mask.view(), None, &nodes, false);
+        let cos_e = cosine(&yd, &ye);
+        assert!(cos_e > 0.8, "extreme sparsity output diverged: cosine {cos_e}");
     }
 
     #[test]

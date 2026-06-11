@@ -456,35 +456,125 @@ impl HtmModel {
             fc,
             residual_proj,
             layer_norm: LayerNorm::new(sdr_dimensions),
+            fc_const: None,
         }
+    }
+
+    /// Right-truncate or zero-pad `input` to the pooler's `input_size`
+    /// (borrowed when the width already matches; hot path: 64-dim GAT
+    /// features into a 128-wide pooler, one zeroed allocation plus a
+    /// block copy).
+    fn pad_to_input_size<'a>(&self, input: ArrayView2<'a, f32>) -> CowArray<'a, f32, Ix2> {
+        let input_size = self.spatial_pooler.input_size;
+        let feat = input.ncols();
+        if feat == input_size {
+            CowArray::from(input)
+        } else {
+            let mut z = Array2::<f32>::zeros((input.nrows(), input_size));
+            let w = feat.min(input_size);
+            z.slice_mut(s![.., ..w]).assign(&input.slice(s![.., ..w]));
+            CowArray::from(z)
+        }
+    }
+
+    /// Sparse top-k output projection: the pooler mask is binary with
+    /// exactly `k = num_active` ones per row, so instead of the dense
+    /// `fc` GEMM (O(C·sdr) per row) accumulate only the active weight
+    /// rows: `out = fc.bias + Σ_{c active} fc.weight.row(c)` —
+    /// O(k·sdr) per row, rayon-parallel over rows, no inner allocation.
+    fn fc_sparse(&self, sp_out: &Array2<f32>) -> Array2<f32> {
+        let weight = &self.fc.weight; // (C, sdr), row-major
+        let bias = self.fc.bias.as_ref().map(|b| {
+            b.as_slice().expect("fc bias is contiguous")
+        });
+        let mut out = Array2::<f32>::zeros((sp_out.nrows(), self.sdr_dimensions));
+        Zip::from(out.rows_mut())
+            .and(sp_out.rows())
+            .par_for_each(|mut orow, srow| {
+                let o = orow.as_slice_mut().expect("output row is contiguous");
+                if let Some(b) = bias {
+                    o.copy_from_slice(b);
+                }
+                for (c, &v) in srow.iter().enumerate() {
+                    if v != 0.0 {
+                        let wrow = weight.row(c);
+                        let w = wrow.as_slice().expect("fc weight row is contiguous");
+                        for (oj, &wj) in o.iter_mut().zip(w) {
+                            *oj += wj;
+                        }
+                    }
+                }
+            });
+        out
+    }
+
+    /// Cached `fc(all-ones)` constant for the degenerate-inhibition fast
+    /// path: per-output column-sums of `fc.weight` plus `fc.bias`.
+    /// Built lazily on first use; `fc` is fixed at inference, so the
+    /// cache is never invalidated.
+    fn fc_const(&mut self) -> &Array1<f32> {
+        if self.fc_const.is_none() {
+            let mut c = self.fc.weight.sum_axis(Axis(0));
+            if let Some(b) = &self.fc.bias {
+                c += b;
+            }
+            self.fc_const = Some(c);
+        }
+        self.fc_const.as_ref().expect("just initialised")
     }
 
     /// `input: (N, feat) -> (N, sdr_dimensions)` where `N = batch * seq`.
     ///
-    /// `feat` is right-truncated or zero-padded to the pooler's
-    /// `input_size` (hot path: 64-dim GAT features into a 128-wide pooler;
-    /// one zeroed allocation plus a block copy).
+    /// Training always runs the full reference pipeline (so homeostasis
+    /// and Hebbian plasticity keep updating). Inference dispatches to the
+    /// fast paths documented on [`HtmModel`]:
+    /// - degenerate inhibition (`num_active == num_minicolumns`, true for
+    ///   the default config) ⇒ skip `input_proj` and the pooler, add the
+    ///   cached `fc(all-ones)` constant to the residual path;
+    /// - otherwise ⇒ run the pooler without training bookkeeping and use
+    ///   the O(k·sdr) sparse projection instead of the dense `fc` GEMM.
     pub fn forward(&mut self, input: &ArrayView2<f32>, training: bool) -> Array2<f32> {
-        let n = input.nrows();
-        let feat = input.ncols();
-        let input_size = self.spatial_pooler.input_size;
+        if training {
+            return self.forward_reference(input, true);
+        }
+        let padded = self.pad_to_input_size(input.view());
 
-        let padded_owned: Array2<f32>;
-        let padded: ArrayView2<f32> = if feat == input_size {
-            input.view()
+        let mut out = if self.spatial_pooler.is_inhibition_degenerate() {
+            // Pooler output is a constant all-ones mask: fold the whole
+            // input_proj + pooler + fc pipeline into one cached vector.
+            let mut res = match &self.residual_proj {
+                Some(proj) => proj.forward(&padded.view()),
+                None => padded.to_owned(),
+            };
+            res += self.fc_const();
+            res
         } else {
-            let mut z = Array2::<f32>::zeros((n, input_size));
-            let w = feat.min(input_size);
-            z.slice_mut(s![.., ..w]).assign(&input.slice(s![.., ..w]));
-            padded_owned = z;
-            padded_owned.view()
+            let x = self.input_proj.forward(&padded.view());
+            let sp_out = self.spatial_pooler.forward(&x.view(), false);
+            let mut out = self.fc_sparse(&sp_out);
+            match &self.residual_proj {
+                Some(proj) => out += &proj.forward(&padded.view()),
+                None => out += &padded,
+            }
+            out
         };
+        self.layer_norm.forward_inplace(out.view_mut());
+        out
+    }
 
-        let x = self.input_proj.forward(&padded);
+    /// Reference full pipeline: `input_proj` GEMM, spatial pooler, dense
+    /// `fc` GEMM, residual, LayerNorm — no fast paths. This is the
+    /// training path, and is exposed (hidden) so tests/benchmarks can
+    /// check the inference fast paths against it bit-for-bit (≤1e-5).
+    #[doc(hidden)]
+    pub fn forward_reference(&mut self, input: &ArrayView2<f32>, training: bool) -> Array2<f32> {
+        let padded = self.pad_to_input_size(input.view());
+
+        let x = self.input_proj.forward(&padded.view());
         let sp_out = self.spatial_pooler.forward(&x.view(), training);
         let mut out = self.fc.forward(&sp_out.view());
         match &self.residual_proj {
-            Some(proj) => out += &proj.forward(&padded),
+            Some(proj) => out += &proj.forward(&padded.view()),
             None => out += &padded,
         }
         self.layer_norm.forward_inplace(out.view_mut());
@@ -647,5 +737,122 @@ mod tests {
         // clamped at 1.
         assert!(pooler.boosting_factors[loser] > 1.0, "starved column not boosted");
         assert_eq!(pooler.boosting_factors[winner], 1.0);
+    }
+
+    fn max_abs_diff(a: &Array2<f32>, b: &Array2<f32>) -> f32 {
+        assert_eq!(a.shape(), b.shape());
+        a.iter()
+            .zip(b.iter())
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0_f32, f32::max)
+    }
+
+    /// Non-degenerate config used by the sparse-path tests:
+    /// C = ceil(512/8) = 64, num_active = min(10, 64) = 10.
+    fn wide_params() -> HtmParams {
+        HtmParams {
+            input_size: 512,
+            minicolumn_size: 8,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn default_config_inhibition_is_degenerate_wide_config_is_not() {
+        // Default: min(10, 8) = 8 winners of 8 columns -> constant mask.
+        let pooler = HtmSpatialPooler::new(&HtmParams::default());
+        assert!(pooler.is_inhibition_degenerate());
+
+        // Wide: 10 winners of 64 columns -> genuinely selective.
+        let pooler = HtmSpatialPooler::new(&wide_params());
+        assert_eq!(pooler.num_minicolumns, 64);
+        assert_eq!(pooler.num_active, 10);
+        assert!(!pooler.is_inhibition_degenerate());
+    }
+
+    #[test]
+    fn degenerate_fast_path_matches_reference_full_path() {
+        let params = HtmParams::default();
+        let mut model = HtmModel::new(256, &params, &mut seeded_rng(11));
+        assert!(
+            model.spatial_pooler.is_inhibition_degenerate(),
+            "fast path must actually engage for the default config"
+        );
+
+        for (n, feat, seed) in [(10usize, 64usize, 20u64), (7, 128, 21), (4, 200, 22)] {
+            let x = random_input(n, feat, seed);
+            // Run the fast path twice: cold (builds fc_const) and warm.
+            let fast_cold = model.forward(&x.view(), false);
+            let fast_warm = model.forward(&x.view(), false);
+            let reference = model.forward_reference(&x.view(), false);
+            assert_eq!(fast_cold, fast_warm, "fast path must be deterministic");
+            let d = max_abs_diff(&fast_cold, &reference);
+            assert!(d <= 1e-5, "fast path diverges from reference: {d}");
+        }
+    }
+
+    #[test]
+    fn sparse_fc_matches_dense_reference_on_non_degenerate_config() {
+        let params = wide_params();
+        let mut model = HtmModel::new(256, &params, &mut seeded_rng(13));
+        assert!(!model.spatial_pooler.is_inhibition_degenerate());
+
+        let x = random_input(9, 64, 30);
+        let fast = model.forward(&x.view(), false); // sparse top-k fc
+        let reference = model.forward_reference(&x.view(), false); // dense fc GEMM
+        let d = max_abs_diff(&fast, &reference);
+        assert!(d <= 1e-5, "sparse fc diverges from dense fc: {d}");
+    }
+
+    #[test]
+    fn sparse_overlap_matches_dense_gemm_and_selects_exactly_k() {
+        // Density gate: 64 columns >= 32 and ~10% connected density
+        // (potential_radius 100 spans ~101 inputs, pct 0.5 -> ~50 of 512).
+        let params = wide_params();
+        let mut pooler = HtmSpatialPooler::new(&params);
+        assert!(
+            pooler.connected_csr.is_some(),
+            "sparse-overlap CSR should be active for the wide config"
+        );
+
+        let x = random_input(16, 512, 40);
+        let sparse = pooler.compute_overlap(&x.view());
+        let dense = x.dot(&pooler.connected_t);
+        let d = max_abs_diff(&sparse, &dense);
+        assert!(d <= 1e-4, "sparse overlap diverges from dense GEMM: {d}");
+
+        let active = pooler.forward(&x.view(), false);
+        for row in active.rows() {
+            assert_eq!(row.sum(), 10.0, "exactly num_active columns per row");
+            assert!(row.iter().all(|&v| v == 0.0 || v == 1.0));
+        }
+
+        // The CSR survives (is rebuilt) after a Hebbian update.
+        pooler.forward(&x.view(), true);
+        assert!(pooler.connected_csr.is_some(), "CSR not rebuilt after training");
+        let after = pooler.compute_overlap(&x.view());
+        let dense_after = x.dot(&pooler.connected_t);
+        assert!(max_abs_diff(&after, &dense_after) <= 1e-4);
+
+        // Tiny default pooler (8 columns) stays on the dense GEMM.
+        let small = HtmSpatialPooler::new(&HtmParams::default());
+        assert!(small.connected_csr.is_none(), "8-column pooler must stay dense");
+    }
+
+    #[test]
+    fn training_still_runs_full_path_with_degenerate_config() {
+        let params = HtmParams::default();
+        let mut model = HtmModel::new(256, &params, &mut seeded_rng(17));
+        assert!(model.spatial_pooler.is_inhibition_degenerate());
+
+        let perms_before = model.spatial_pooler.permanences.clone();
+        let x = random_input(8, 64, 50);
+        let out = model.forward(&x.view(), true);
+        assert_eq!(out.shape(), &[8, 256]);
+        assert_ne!(
+            model.spatial_pooler.permanences, perms_before,
+            "training forward must still apply the Hebbian update"
+        );
+        assert_eq!(model.spatial_pooler.step_count, 1, "homeostasis must still run");
     }
 }
